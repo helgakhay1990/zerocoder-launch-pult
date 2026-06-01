@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 import subprocess
@@ -81,6 +82,67 @@ def ask(
             rc, out, err = _run(base + ["--session-id", session_id], cwd, timeout)
     else:
         rc, out, err = _run(base, cwd, timeout)
+
+    if rc != 0:
+        raise OrchestraError(f"claude вернул код {rc}: {(err or out).strip()[:500]}")
+    return out.strip() or "Оркестр вернул пустой ответ."
+
+
+async def _run_async(cmd: list[str], cwd: Path, timeout: int):
+    """Асинхронный аналог _run: не блокирует event-loop бота, пока крутится claude."""
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        cwd=str(cwd),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise OrchestraError(
+            f"Оркестр не ответил за {timeout} с. Сузь запрос или подними ORCHESTRA_TIMEOUT."
+        )
+    return (
+        proc.returncode,
+        out.decode(errors="replace"),
+        err.decode(errors="replace"),
+    )
+
+
+async def ask_async(
+    prompt: str,
+    cwd: Path | None = None,
+    timeout: int | None = None,
+    session_id: str | None = None,
+) -> str:
+    """Асинхронная версия ask() для бота — та же логика сессий, но не вешает бот.
+
+    Пока claude обрабатывает запрос, event-loop свободен: бот отвечает на другие
+    сообщения. Поведение по сессиям и правам идентично ask().
+    """
+    if not prompt.strip():
+        raise OrchestraError("Пустой запрос.")
+    if not claude_available():
+        raise OrchestraError(
+            f"Не найден исполняемый файл '{CLAUDE_BIN}'. Установлен ли Claude Code?"
+        )
+
+    cwd = Path(cwd) if cwd else ORCHESTRA_CWD
+    timeout = timeout or ASK_TIMEOUT
+    base = [CLAUDE_BIN, "-p", prompt]
+    if ALLOWED_TOOLS:
+        base += ["--allowedTools", *ALLOWED_TOOLS]
+
+    if session_id:
+        rc, out, err = await _run_async(base + ["--resume", session_id], cwd, timeout)
+        if rc != 0:
+            rc, out, err = await _run_async(
+                base + ["--session-id", session_id], cwd, timeout
+            )
+    else:
+        rc, out, err = await _run_async(base, cwd, timeout)
 
     if rc != 0:
         raise OrchestraError(f"claude вернул код {rc}: {(err or out).strip()[:500]}")

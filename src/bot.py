@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -109,6 +110,19 @@ def _session_id(chat_id: int) -> str:
     return str(uuid.uuid5(_SESSION_NS, f"pult-{chat_id}-{epoch}"))
 
 
+async def _keep_typing(bot, chat_id: int, stop: asyncio.Event) -> None:
+    """Держать индикатор «печатает…», пока оркестр думает (он живёт ~5 сек)."""
+    while not stop.is_set():
+        try:
+            await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+        except Exception:  # noqa: BLE001 — индикатор не критичен
+            pass
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=4)
+        except asyncio.TimeoutError:
+            pass
+
+
 @restricted
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -135,15 +149,28 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @restricted
 async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     question = update.message.text.strip()
-    await context.bot.send_chat_action(
-        chat_id=update.effective_chat.id, action=ChatAction.TYPING
-    )
+    chat_id = update.effective_chat.id
+
+    # Мгновенная обратная связь + живой индикатор «печатает». Вызов оркестра —
+    # асинхронный, поэтому бот не висит и параллельно отвечает на другие сообщения.
+    ack = await update.message.reply_text("Принял, работаю над задачей… 🛠")
+    stop = asyncio.Event()
+    typing = asyncio.create_task(_keep_typing(context.bot, chat_id, stop))
     try:
         answer = md_to_plain(
-            orchestra.ask(question, session_id=_session_id(update.effective_chat.id))
+            await orchestra.ask_async(question, session_id=_session_id(chat_id))
         )
     except orchestra.OrchestraError as e:
         answer = f"⚠️ {e}"
+    finally:
+        stop.set()
+        await typing
+
+    try:
+        await ack.delete()
+    except Exception:  # noqa: BLE001 — не смогли убрать ack, не страшно
+        pass
+
     # Telegram режет сообщения длиннее 4096 символов.
     for chunk in (answer[i : i + 4000] for i in range(0, len(answer), 4000)):
         await update.message.reply_text(chunk)
