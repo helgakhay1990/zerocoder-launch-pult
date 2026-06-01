@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from functools import wraps
 from pathlib import Path
 
@@ -65,6 +66,16 @@ def _load_env() -> tuple[str, int]:
 ALLOWED_USER_ID = 0  # перезапишется в main()
 
 
+def md_to_plain(text: str) -> str:
+    """Лёгкая чистка Markdown оркестра для Telegram: убрать **, __, `,
+    маркеры заголовков. Списки и переносы оставляем как есть."""
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)  # **жирный**
+    text = re.sub(r"__(.+?)__", r"\1", text)  # __подчёркнутый__
+    text = re.sub(r"`([^`]+)`", r"\1", text)  # `код`
+    text = re.sub(r"^#{1,6}\s*", "", text, flags=re.MULTILINE)  # ## заголовок
+    return text
+
+
 def restricted(func):
     """Пускать только владельца. Остальным — короткий отказ в лог и в чат."""
 
@@ -106,7 +117,7 @@ async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id=update.effective_chat.id, action=ChatAction.TYPING
     )
     try:
-        answer = orchestra.ask(question)
+        answer = md_to_plain(orchestra.ask(question))
     except orchestra.OrchestraError as e:
         answer = f"⚠️ {e}"
     # Telegram режет сообщения длиннее 4096 символов.
