@@ -1,0 +1,15 @@
+# Секреты
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# macOS
+.DS_Store
+
+# Вспомогательный файл для рендера скриншота — не часть проекта
+screenshots/_render.html
