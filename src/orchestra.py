@@ -19,6 +19,11 @@ ORCHESTRA_CWD = Path(
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 ASK_TIMEOUT = int(os.environ.get("ORCHESTRA_TIMEOUT", "180"))
 
+# Точечные права записи: разрешаем только Write и Edit (создать/изменить файл).
+# Bash в список НЕ входит — значит удаление (rm) и деструктивные команды закрыты.
+# Чтение и запуск субагентов и так доступны по умолчанию. Пусто — режим read-only.
+ALLOWED_TOOLS = os.environ.get("ORCHESTRA_ALLOWED_TOOLS", "Write Edit").split()
+
 
 class OrchestraError(RuntimeError):
     pass
@@ -41,9 +46,12 @@ def ask(prompt: str, cwd: Path | None = None, timeout: int | None = None) -> str
         )
 
     cwd = Path(cwd) if cwd else ORCHESTRA_CWD
+    cmd = [CLAUDE_BIN, "-p", prompt]
+    if ALLOWED_TOOLS:
+        cmd += ["--allowedTools", *ALLOWED_TOOLS]
     try:
         result = subprocess.run(
-            [CLAUDE_BIN, "-p", prompt],
+            cmd,
             cwd=str(cwd),
             capture_output=True,
             text=True,
