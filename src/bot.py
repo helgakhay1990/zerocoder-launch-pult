@@ -4,7 +4,8 @@
 Команды:
     /start   — приветствие и подсказка
     /status  — статус-борд по _state.md (через tracker)
-    любой текст — вопрос оркестру через claude -p (через orchestra)
+    /reset   — забыть контекст диалога, начать сессию заново
+    любой текст — вопрос оркестру через claude -p (с памятью на чат)
 
 Запуск:
     python src/bot.py
@@ -15,6 +16,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import uuid
 from functools import wraps
 from pathlib import Path
 
@@ -95,13 +97,33 @@ def restricted(func):
     return wrapped
 
 
+# Память диалога: на каждый чат — своя сессия claude. uuid детерминирован из
+# chat_id и «эпохи»; /reset увеличивает эпоху → новая сессия, старый контекст забыт.
+# Сессии claude хранятся на диске, поэтому память переживает перезапуск бота.
+_SESSION_NS = uuid.NAMESPACE_URL
+_epoch: dict[int, int] = {}
+
+
+def _session_id(chat_id: int) -> str:
+    epoch = _epoch.get(chat_id, 0)
+    return str(uuid.uuid5(_SESSION_NS, f"pult-{chat_id}-{epoch}"))
+
+
 @restricted
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Пульт оркестра на связи.\n\n"
         "• /status — статус всех запусков\n"
-        "• просто напиши вопрос — отвечу через оркестр субагентов"
+        "• /reset — забыть контекст и начать заново\n"
+        "• просто напиши вопрос — отвечу через оркестр (помню контекст диалога)"
     )
+
+
+@restricted
+async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    _epoch[chat_id] = _epoch.get(chat_id, 0) + 1
+    await update.message.reply_text("Контекст сброшен — начинаем диалог заново.")
 
 
 @restricted
@@ -117,7 +139,9 @@ async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id=update.effective_chat.id, action=ChatAction.TYPING
     )
     try:
-        answer = md_to_plain(orchestra.ask(question))
+        answer = md_to_plain(
+            orchestra.ask(question, session_id=_session_id(update.effective_chat.id))
+        )
     except orchestra.OrchestraError as e:
         answer = f"⚠️ {e}"
     # Telegram режет сообщения длиннее 4096 символов.
@@ -132,6 +156,7 @@ def main() -> None:
     app = ApplicationBuilder().token(token).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("reset", reset))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ask))
 
     log.info("Пульт оркестра запущен. Владелец: %s", ALLOWED_USER_ID)

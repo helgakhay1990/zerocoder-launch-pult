@@ -33,8 +33,31 @@ def claude_available() -> bool:
     return shutil.which(CLAUDE_BIN) is not None
 
 
-def ask(prompt: str, cwd: Path | None = None, timeout: int | None = None) -> str:
+def _run(cmd: list[str], cwd: Path, timeout: int):
+    """Запустить claude и вернуть (код возврата, stdout, stderr).
+    На таймауте — сразу OrchestraError (повторять смысла нет)."""
+    try:
+        r = subprocess.run(
+            cmd, cwd=str(cwd), capture_output=True, text=True, timeout=timeout
+        )
+    except subprocess.TimeoutExpired:
+        raise OrchestraError(
+            f"Оркестр не ответил за {timeout} с. Сузь запрос или подними ORCHESTRA_TIMEOUT."
+        )
+    return r.returncode, r.stdout, r.stderr
+
+
+def ask(
+    prompt: str,
+    cwd: Path | None = None,
+    timeout: int | None = None,
+    session_id: str | None = None,
+) -> str:
     """Передать запрос оркестру и вернуть текстовый ответ.
+
+    Если задан session_id — диалог с памятью: сначала пробуем продолжить сессию
+    (--resume), при неудаче (сессии ещё нет / новый /reset) создаём её (--session-id).
+    Без session_id — разовый запрос без памяти (как из CLI).
 
     Бросает OrchestraError, если claude не найден, упал или превысил таймаут.
     """
@@ -46,28 +69,22 @@ def ask(prompt: str, cwd: Path | None = None, timeout: int | None = None) -> str
         )
 
     cwd = Path(cwd) if cwd else ORCHESTRA_CWD
-    cmd = [CLAUDE_BIN, "-p", prompt]
+    timeout = timeout or ASK_TIMEOUT
+    base = [CLAUDE_BIN, "-p", prompt]
     if ALLOWED_TOOLS:
-        cmd += ["--allowedTools", *ALLOWED_TOOLS]
-    try:
-        result = subprocess.run(
-            cmd,
-            cwd=str(cwd),
-            capture_output=True,
-            text=True,
-            timeout=timeout or ASK_TIMEOUT,
-        )
-    except subprocess.TimeoutExpired:
-        raise OrchestraError(
-            f"Оркестр не ответил за {timeout or ASK_TIMEOUT} с. Попробуй сузить запрос."
-        )
+        base += ["--allowedTools", *ALLOWED_TOOLS]
 
-    if result.returncode != 0:
-        err = (result.stderr or result.stdout).strip()
-        raise OrchestraError(f"claude вернул код {result.returncode}: {err[:500]}")
+    if session_id:
+        # Продолжить существующую сессию; если её нет — создать с этим же id.
+        rc, out, err = _run(base + ["--resume", session_id], cwd, timeout)
+        if rc != 0:
+            rc, out, err = _run(base + ["--session-id", session_id], cwd, timeout)
+    else:
+        rc, out, err = _run(base, cwd, timeout)
 
-    answer = result.stdout.strip()
-    return answer or "Оркестр вернул пустой ответ."
+    if rc != 0:
+        raise OrchestraError(f"claude вернул код {rc}: {(err or out).strip()[:500]}")
+    return out.strip() or "Оркестр вернул пустой ответ."
 
 
 if __name__ == "__main__":
