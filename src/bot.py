@@ -1,8 +1,10 @@
 """Telegram-бот «Пульт оркестра».
 
 Замкнут строго на один Telegram user ID (твой). Любой другой — игнор.
-Команды:
-    /start   — приветствие и подсказка
+
+Управление — кнопочным меню (всегда внизу): «📊 Статус», «🔄 Сброс», «❓ Помощь».
+Команды набирать не нужно, но они тоже работают:
+    /start   — приветствие + показать меню
     /status  — статус-борд по _state.md (через tracker)
     /reset   — забыть контекст диалога, начать сессию заново
     любой текст — вопрос оркестру через claude -p (с памятью на чат)
@@ -21,14 +23,26 @@ import uuid
 from functools import wraps
 from pathlib import Path
 
-from telegram import Update
+from telegram import BotCommand, ReplyKeyboardMarkup, Update
 from telegram.constants import ChatAction
 from telegram.ext import (
+    Application,
     ApplicationBuilder,
     CommandHandler,
     ContextTypes,
     MessageHandler,
     filters,
+)
+
+# ── Кнопочное меню (всегда внизу, тапаешь вместо набора команд) ──
+BTN_STATUS = "📊 Статус"
+BTN_RESET = "🔄 Сброс"
+BTN_HELP = "❓ Помощь"
+
+MENU = ReplyKeyboardMarkup(
+    [[BTN_STATUS], [BTN_RESET, BTN_HELP]],
+    resize_keyboard=True,
+    is_persistent=True,
 )
 
 # tracker / orchestra лежат рядом, в той же папке src.
@@ -127,9 +141,12 @@ async def _keep_typing(bot, chat_id: int, stop: asyncio.Event) -> None:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Пульт оркестра на связи.\n\n"
-        "• /status — статус всех запусков\n"
-        "• /reset — забыть контекст и начать заново\n"
-        "• просто напиши вопрос — отвечу через оркестр (помню контекст диалога)"
+        "Меню снизу — тапай кнопку, команды набирать не нужно:\n"
+        f"• {BTN_STATUS} — статус всех запусков\n"
+        f"• {BTN_RESET} — забыть контекст и начать заново\n"
+        f"• {BTN_HELP} — это сообщение\n\n"
+        "Или просто напиши вопрос — отвечу через оркестр (помню контекст диалога).",
+        reply_markup=MENU,
     )
 
 
@@ -176,14 +193,29 @@ async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(chunk)
 
 
+async def _post_init(app: Application) -> None:
+    """Прописать команды в системное «/»-меню Telegram (подсказки рядом с полем ввода)."""
+    await app.bot.set_my_commands(
+        [
+            BotCommand("status", "Статус всех запусков"),
+            BotCommand("reset", "Забыть контекст диалога"),
+            BotCommand("start", "Меню и помощь"),
+        ]
+    )
+
+
 def main() -> None:
     global ALLOWED_USER_ID
     token, ALLOWED_USER_ID = _load_env()
 
-    app = ApplicationBuilder().token(token).build()
+    app = ApplicationBuilder().token(token).post_init(_post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("reset", reset))
+    # Кнопки меню шлют свой текст-метку — ловим ДО общего обработчика вопросов.
+    app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_STATUS)}$"), status))
+    app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_RESET)}$"), reset))
+    app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_HELP)}$"), start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ask))
 
     log.info("Пульт оркестра запущен. Владелец: %s", ALLOWED_USER_ID)
