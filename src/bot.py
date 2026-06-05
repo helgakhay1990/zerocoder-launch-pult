@@ -30,6 +30,7 @@ from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     ContextTypes,
+    ConversationHandler,
     MessageHandler,
     filters,
 )
@@ -38,12 +39,20 @@ from telegram.ext import (
 BTN_STATUS = "📊 Статус"
 BTN_RESET = "🔄 Сброс"
 BTN_HELP = "❓ Помощь"
+BTN_MONTAGE = "🎬 ТЗ на монтаж"
 
 MENU = ReplyKeyboardMarkup(
-    [[BTN_STATUS], [BTN_RESET, BTN_HELP]],
+    [[BTN_MONTAGE], [BTN_STATUS], [BTN_RESET, BTN_HELP]],
     resize_keyboard=True,
     is_persistent=True,
 )
+
+# Шаги диалога сборки ТЗ на монтаж
+M_SOURCE, M_WINDOWS, M_NOTES = range(3)
+# Что пользователь печатает, чтобы пропустить необязательный шаг
+SKIP_WORDS = {"нет", "-", "—", "skip", "пропустить", "пропуск", "no"}
+# Интервал опроса фоновых задач монтажа (сек)
+MONTAGE_POLL_INTERVAL = 30
 
 # tracker / orchestra лежат рядом, в той же папке src.
 import sys
@@ -51,6 +60,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import tracker  # noqa: E402
 import orchestra  # noqa: E402
+import montage_jobs  # noqa: E402
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -193,15 +203,144 @@ async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(chunk)
 
 
+# ── Диалог сборки ТЗ на монтаж ───────────────────────────────────────────────
+# Кнопка «🎬 ТЗ на монтаж» → спрашиваем источник → окна экрана → заметки автора →
+# ставим фоновую задачу montage_tz.py. Бот не висит; черновик придёт файлом, когда
+# пайплайн досчитает (его ловит наблюдатель _montage_watcher).
+
+
+@restricted
+async def montage_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if montage_jobs.running_jobs():
+        await update.message.reply_text(
+            "Уже считаю одну запись 🎬 Дождись её готовности — запущу следующую.",
+            reply_markup=MENU,
+        )
+        return ConversationHandler.END
+    context.user_data["montage"] = {}
+    await update.message.reply_text(
+        "🎬 Собираю ТЗ на монтаж.\n\n"
+        "Шаг 1/3. Кинь источник записи — Kinescope video_id или ссылку.\n"
+        "В любой момент: /cancel — отмена."
+    )
+    return M_SOURCE
+
+
+@restricted
+async def montage_source(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["montage"]["source"] = update.message.text.strip()
+    await update.message.reply_text(
+        "Шаг 2/3. Окна показа экрана — где демонстрировали экран (для OCR).\n"
+        "Формат: `20m-50m,1h15m-1h40m`.\n"
+        "Если не знаешь или показа не было — напиши «нет» (отсканирую без экранного слоя).",
+        parse_mode="Markdown",
+    )
+    return M_WINDOWS
+
+
+@restricted
+async def montage_windows(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    context.user_data["montage"]["windows"] = "" if text.lower() in SKIP_WORDS else text
+    await update.message.reply_text(
+        "Шаг 3/3. Что знаешь точно? Известные моменты пойдут в черновик как высокоуверенная "
+        "затравка.\n"
+        "По пункту в строке, можно с таймкодом: `35:00 цена 990 на слайде`.\n"
+        "Если нечего добавить — напиши «нет».",
+        parse_mode="Markdown",
+    )
+    return M_NOTES
+
+
+@restricted
+async def montage_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    data = context.user_data.get("montage", {})
+    notes = "" if text.lower() in SKIP_WORDS else re.sub(r"\n+", "; ", text)
+    try:
+        job = montage_jobs.create_job(
+            chat_id=update.effective_chat.id,
+            source=data.get("source", ""),
+            windows=data.get("windows", ""),
+            notes=notes,
+        )
+    except Exception as e:  # noqa: BLE001 — показываем причину пользователю
+        await update.message.reply_text(f"⚠️ Не запустил: {e}", reply_markup=MENU)
+        return ConversationHandler.END
+
+    win_txt = data.get("windows") or "без окон экрана (скан всей записи)"
+    notes_txt = notes or "—"
+    await update.message.reply_text(
+        "Принял, считаю в фоне ⏳\n\n"
+        f"• Источник: {data.get('source')}\n"
+        f"• Окна экрана: {win_txt}\n"
+        f"• Заметки автора: {notes_txt}\n\n"
+        "whisper по записи в часы идёт ~10–20 минут. Пришлю черновик файлом, когда досчитаю. "
+        "Можно продолжать переписку — бот не висит.",
+        reply_markup=MENU,
+    )
+    context.user_data.pop("montage", None)
+    return ConversationHandler.END
+
+
+@restricted
+async def montage_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("montage", None)
+    await update.message.reply_text("Отменил сборку ТЗ.", reply_markup=MENU)
+    return ConversationHandler.END
+
+
+async def _montage_watcher(app: Application) -> None:
+    """Фоновая петля: раз в MONTAGE_POLL_INTERVAL сверяет фоновые задачи монтажа и
+    досылает владельцу готовый черновик (или причину падения). Переживает рестарт —
+    источник правды это jobs/<id>.json, а не дочерний процесс."""
+    while True:
+        try:
+            for job in montage_jobs.poll_jobs():
+                chat_id = job.get("chat_id")
+                if not chat_id:
+                    montage_jobs.mark_notified(job["id"])
+                    continue
+                try:
+                    if job["status"] == "done":
+                        out = Path(job["out_path"])
+                        with out.open("rb") as fh:
+                            await app.bot.send_document(
+                                chat_id=chat_id,
+                                document=fh,
+                                filename=out.name,
+                                caption=(
+                                    "✅ Черновик ТЗ на монтаж готов.\n"
+                                    "Это черновик на сверку — не финал монтажёру. "
+                                    "Дальше: video-edit-assistant → сверка с автором."
+                                ),
+                            )
+                    else:
+                        tail = job.get("error_tail", "") or "лог пуст"
+                        await app.bot.send_message(
+                            chat_id=chat_id,
+                            text=f"⚠️ Сборка ТЗ упала (источник: {job.get('source')}).\n\n"
+                                 f"Хвост лога:\n{tail[-1000:]}",
+                        )
+                    montage_jobs.mark_notified(job["id"])
+                except Exception:  # noqa: BLE001 — не смогли отправить, попробуем в следующий цикл
+                    log.exception("Не удалось отправить результат монтажа job=%s", job.get("id"))
+        except Exception:  # noqa: BLE001 — петля не должна умирать
+            log.exception("Сбой в наблюдателе монтажа")
+        await asyncio.sleep(MONTAGE_POLL_INTERVAL)
+
+
 async def _post_init(app: Application) -> None:
-    """Прописать команды в системное «/»-меню Telegram (подсказки рядом с полем ввода)."""
+    """Прописать команды в системное «/»-меню Telegram и поднять наблюдателя монтажа."""
     await app.bot.set_my_commands(
         [
+            BotCommand("montage", "Собрать ТЗ на монтаж записи"),
             BotCommand("status", "Статус всех запусков"),
             BotCommand("reset", "Забыть контекст диалога"),
             BotCommand("start", "Меню и помощь"),
         ]
     )
+    app.create_task(_montage_watcher(app))
 
 
 def main() -> None:
@@ -212,6 +351,25 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("reset", reset))
+
+    # Диалог ТЗ на монтаж — отдельная ветка, ловится ДО общего обработчика вопросов.
+    montage_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("montage", montage_start),
+            MessageHandler(filters.Regex(f"^{re.escape(BTN_MONTAGE)}$"), montage_start),
+        ],
+        states={
+            M_SOURCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, montage_source)],
+            M_WINDOWS: [MessageHandler(filters.TEXT & ~filters.COMMAND, montage_windows)],
+            M_NOTES: [MessageHandler(filters.TEXT & ~filters.COMMAND, montage_notes)],
+        },
+        fallbacks=[
+            CommandHandler("cancel", montage_cancel),
+            MessageHandler(filters.Regex(f"^{re.escape(BTN_RESET)}$"), montage_cancel),
+        ],
+    )
+    app.add_handler(montage_conv)
+
     # Кнопки меню шлют свой текст-метку — ловим ДО общего обработчика вопросов.
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_STATUS)}$"), status))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_RESET)}$"), reset))
