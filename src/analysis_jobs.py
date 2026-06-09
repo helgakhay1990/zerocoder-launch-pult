@@ -30,11 +30,15 @@ AUDITS_DIR = PROJECT_ROOT / "audits"
 JOBS_DIR = LAUNCH_PULT_ROOT / "jobs" / "analysis"
 
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
-# Что разрешаем оркестру в фоне: чтение, веб, запуск субагентов и запись файла.
-# Bash НЕ включён — деструктивные команды закрыты.
+# Что разрешаем оркестру в фоне: чтение, веб, запуск субагентов, запись файла и
+# playwright (браузер) для цен/контента за JS. Bash НЕ включён — деструктив закрыт.
 ALLOWED_TOOLS = os.environ.get(
-    "ANALYSIS_ALLOWED_TOOLS", "Read Write Edit Glob Grep WebFetch WebSearch Task"
+    "ANALYSIS_ALLOWED_TOOLS",
+    "Read Write Edit Glob Grep WebFetch WebSearch Task mcp__playwright",
 ).split()
+# Свой MCP-конфиг для фоновых задач: playwright в ИЗОЛИРОВАННОМ headless-профиле,
+# чтобы не ловить lock общего профиля с основной сессией (тогда цены идут 🟢, не 🟡).
+ANALYSIS_MCP_CONFIG = LAUNCH_PULT_ROOT / "mcp-analysis.json"
 MAX_CONCURRENT = 1
 
 
@@ -97,9 +101,11 @@ def _build_competitor_prompt(targets: str, focus: str, out_path: Path) -> str:
         f"Ось сравнения: {focus_line}\n\n"
         "Как работать:\n"
         "1. Открой скилл `.claude/skills/ai-competitors/SKILL.md` и иди по его чек-листу.\n"
-        "2. Где возможно — посмотри страницы конкурентов (WebFetch/WebSearch). Цены на Tilda/за "
-        "JS могут не достаться — это ПОМЕЧАЙ как пробел, не выдумывай.\n"
-        "3. Каждый факт — со ссылкой на источник. Ничего не додумывай: нет данных — так и пиши.\n\n"
+        "2. Сначала пробуй WebFetch/WebSearch. Если страница даёт 403 или цена подгружается JS "
+        "(Tilda и пр.) — открой её браузером playwright (mcp__playwright__browser_navigate, затем "
+        "browser_snapshot) и сними цену оттуда. Браузер изолированный, lock-а профиля нет.\n"
+        "3. Только если и браузер не достал — ПОМЕЧАЙ как пробел. Ничего не додумывай: нет данных "
+        "— так и пиши. Каждый факт — со ссылкой на источник.\n\n"
         f"Сохрани результат инструментом Write строго в файл:\n{out_path}\n\n"
         "Структура файла (markdown):\n"
         "- Заголовок + дата + список разобранных конкурентов.\n"
@@ -120,8 +126,9 @@ def _build_audit_prompt(url: str, focus: str, out_path: Path) -> str:
         "Как работать:\n"
         "1. Запусти субагента `landing-auditor` (он зеркало landing-architect: не переписывает блоки, "
         "а диагностирует и приоритизирует) — передай ему URL и фокус.\n"
-        "2. Открой страницу (WebFetch). Если вернётся 403 или контент подгружается JS — это часто "
-        "ложная блокировка: пометь, что часть не отсмотрена, и не выдумывай содержимое.\n"
+        "2. Открой страницу: сначала WebFetch. Если 403 или контент за JS — открой браузером "
+        "playwright (mcp__playwright__browser_navigate + browser_snapshot) и смотри живой DOM. "
+        "Браузер изолированный, lock-а нет. Что и так не отсмотрелось — помечай, не выдумывай.\n"
         "3. Ссылки проверяй осторожно: `curl`/WebFetch дают ложный 403 — помечай «проверить в браузере», "
         "а не сразу «битая».\n"
         "4. Каждая находка — с пруфом (цитата/блок со страницы), без догадок.\n\n"
@@ -136,7 +143,7 @@ def _build_audit_prompt(url: str, focus: str, out_path: Path) -> str:
     )
 
 
-def _launch_job(chat_id: int, prompt: str, out_path: Path, kind: str, meta: dict) -> dict:
+def _launch_job(chat_id: int, job_id: str, prompt: str, out_path: Path, kind: str, meta: dict) -> dict:
     """Общий запуск фоновой задачи-оркестра: детач `claude -p`, который сам пишет
     файл-результат в out_path. Возвращает job json (источник правды о задаче)."""
     if not claude_available():
@@ -146,7 +153,6 @@ def _launch_job(chat_id: int, prompt: str, out_path: Path, kind: str, meta: dict
     if len(running_jobs()) >= MAX_CONCURRENT:
         raise RuntimeError("Уже считаю одну задачу. Дождись результата и запусти следующую.")
 
-    job_id = uuid.uuid4().hex[:8]
     now = dt.datetime.now().isoformat(timespec="seconds")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     JOBS_DIR.mkdir(parents=True, exist_ok=True)
@@ -155,6 +161,10 @@ def _launch_job(chat_id: int, prompt: str, out_path: Path, kind: str, meta: dict
     cmd = [CLAUDE_BIN, "-p", prompt]
     if ALLOWED_TOOLS:
         cmd += ["--allowedTools", *ALLOWED_TOOLS]
+    # Изолированный playwright только для фоновой задачи (strict → грузим лишь его,
+    # без коллизии с playwright основной сессии). Если конфига нет — работаем без него.
+    if ANALYSIS_MCP_CONFIG.exists():
+        cmd += ["--mcp-config", str(ANALYSIS_MCP_CONFIG), "--strict-mcp-config"]
 
     log_f = open(log_path, "w", encoding="utf-8")  # noqa: SIM115
     proc = subprocess.Popen(
@@ -181,20 +191,22 @@ def _launch_job(chat_id: int, prompt: str, out_path: Path, kind: str, meta: dict
 
 def create_competitor_job(chat_id: int, targets: str, focus: str = "") -> dict:
     """Фоновый разбор конкурентов через `claude -p` (оркестр пишет файл сам)."""
-    job_id_path = RESEARCH_DIR / f"{dt.date.today():%Y-%m-%d}_competitors-{uuid.uuid4().hex[:8]}_compare.md"
-    prompt = _build_competitor_prompt(targets, focus, job_id_path)
+    job_id = uuid.uuid4().hex[:8]
+    out_path = RESEARCH_DIR / f"{dt.date.today():%Y-%m-%d}_competitors-{job_id}_compare.md"
+    prompt = _build_competitor_prompt(targets, focus, out_path)
     return _launch_job(
-        chat_id, prompt, job_id_path, kind="competitors",
+        chat_id, job_id, prompt, out_path, kind="competitors",
         meta={"targets": targets, "focus": focus},
     )
 
 
 def create_audit_job(chat_id: int, url: str, focus: str = "") -> dict:
     """Фоновый аудит живой посадочной страницы через `claude -p` (landing-auditor)."""
-    out_path = AUDITS_DIR / f"{dt.date.today():%Y-%m-%d}_audit-{uuid.uuid4().hex[:8]}.md"
+    job_id = uuid.uuid4().hex[:8]
+    out_path = AUDITS_DIR / f"{dt.date.today():%Y-%m-%d}_audit-{job_id}.md"
     prompt = _build_audit_prompt(url, focus, out_path)
     return _launch_job(
-        chat_id, prompt, out_path, kind="audit",
+        chat_id, job_id, prompt, out_path, kind="audit",
         meta={"url": url, "focus": focus},
     )
 
