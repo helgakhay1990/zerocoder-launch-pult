@@ -26,6 +26,7 @@ from pathlib import Path
 LAUNCH_PULT_ROOT = Path(__file__).resolve().parents[1]      # .../launch-pult
 PROJECT_ROOT = Path(__file__).resolve().parents[2]          # .../Ai-homework
 RESEARCH_DIR = PROJECT_ROOT / "research"
+AUDITS_DIR = PROJECT_ROOT / "audits"
 JOBS_DIR = LAUNCH_PULT_ROOT / "jobs" / "analysis"
 
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
@@ -87,7 +88,7 @@ def claude_available() -> bool:
     return shutil.which(CLAUDE_BIN) is not None
 
 
-def _build_prompt(targets: str, focus: str, out_path: Path) -> str:
+def _build_competitor_prompt(targets: str, focus: str, out_path: Path) -> str:
     focus_line = focus.strip() or "цены/тарифы, форматы обучения, длительность, оффер, гарантии возврата"
     return (
         "Ты — аналитик ниши онлайн-обучения ИИ и ИТ. Задача: сравнить конкурентов и "
@@ -109,23 +110,48 @@ def _build_prompt(targets: str, focus: str, out_path: Path) -> str:
     )
 
 
-def create_competitor_job(chat_id: int, targets: str, focus: str = "") -> dict:
-    """Запустить фоновый разбор конкурентов через `claude -p` (оркестр пишет файл сам)."""
+def _build_audit_prompt(url: str, focus: str, out_path: Path) -> str:
+    focus_line = focus.strip() or "оффер на первом экране, структура и логика прокрутки, конверсионные узлы, правдивость заявлений, битые/слабые ссылки"
+    return (
+        "Ты — аудитор посадочных страниц. Задача: проверить ЖИВУЮ страницу и собрать "
+        "ранжированный список правок ОТДЕЛЬНЫМ ФАЙЛОМ.\n\n"
+        f"Страница для аудита: {url}\n"
+        f"Фокус проверки: {focus_line}\n\n"
+        "Как работать:\n"
+        "1. Запусти субагента `landing-auditor` (он зеркало landing-architect: не переписывает блоки, "
+        "а диагностирует и приоритизирует) — передай ему URL и фокус.\n"
+        "2. Открой страницу (WebFetch). Если вернётся 403 или контент подгружается JS — это часто "
+        "ложная блокировка: пометь, что часть не отсмотрена, и не выдумывай содержимое.\n"
+        "3. Ссылки проверяй осторожно: `curl`/WebFetch дают ложный 403 — помечай «проверить в браузере», "
+        "а не сразу «битая».\n"
+        "4. Каждая находка — с пруфом (цитата/блок со страницы), без догадок.\n\n"
+        f"Сохрани результат инструментом Write строго в файл:\n{out_path}\n\n"
+        "Структура файла (markdown):\n"
+        "- Заголовок + URL + дата аудита.\n"
+        "- Находки, РАНЖИРОВАННЫЕ по важности (критично / средне / мелочь): что не так + почему + пруф.\n"
+        "- Отдельно — ссылки под проверку.\n"
+        "- Раздел «Не отсмотрено» — что не удалось проверить и почему.\n"
+        "- Короткое резюме: топ-3 правки с наибольшим эффектом.\n\n"
+        f"В конце ответа верни ровно одну строку: СОХРАНЕНО: {out_path}"
+    )
+
+
+def _launch_job(chat_id: int, prompt: str, out_path: Path, kind: str, meta: dict) -> dict:
+    """Общий запуск фоновой задачи-оркестра: детач `claude -p`, который сам пишет
+    файл-результат в out_path. Возвращает job json (источник правды о задаче)."""
     if not claude_available():
         raise RuntimeError(
             f"Не найден '{CLAUDE_BIN}' — оркестр недоступен. Установлен ли Claude Code?"
         )
     if len(running_jobs()) >= MAX_CONCURRENT:
-        raise RuntimeError("Уже считаю один разбор. Дождись результата и запусти следующий.")
+        raise RuntimeError("Уже считаю одну задачу. Дождись результата и запусти следующую.")
 
     job_id = uuid.uuid4().hex[:8]
     now = dt.datetime.now().isoformat(timespec="seconds")
-    RESEARCH_DIR.mkdir(parents=True, exist_ok=True)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     JOBS_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = RESEARCH_DIR / f"{dt.date.today():%Y-%m-%d}_competitors-{job_id}_compare.md"
     log_path = JOBS_DIR / f"{job_id}.log"
 
-    prompt = _build_prompt(targets, focus, out_path)
     cmd = [CLAUDE_BIN, "-p", prompt]
     if ALLOWED_TOOLS:
         cmd += ["--allowedTools", *ALLOWED_TOOLS]
@@ -138,10 +164,8 @@ def create_competitor_job(chat_id: int, targets: str, focus: str = "") -> dict:
 
     job = {
         "id": job_id,
-        "kind": "competitors",
+        "kind": kind,
         "chat_id": chat_id,
-        "targets": targets,
-        "focus": focus,
         "status": "running",
         "pid": proc.pid,
         "out_path": str(out_path),
@@ -149,9 +173,30 @@ def create_competitor_job(chat_id: int, targets: str, focus: str = "") -> dict:
         "started_at": now,
         "finished_at": None,
         "notified": False,
+        **meta,
     }
     _write_job(job)
     return job
+
+
+def create_competitor_job(chat_id: int, targets: str, focus: str = "") -> dict:
+    """Фоновый разбор конкурентов через `claude -p` (оркестр пишет файл сам)."""
+    job_id_path = RESEARCH_DIR / f"{dt.date.today():%Y-%m-%d}_competitors-{uuid.uuid4().hex[:8]}_compare.md"
+    prompt = _build_competitor_prompt(targets, focus, job_id_path)
+    return _launch_job(
+        chat_id, prompt, job_id_path, kind="competitors",
+        meta={"targets": targets, "focus": focus},
+    )
+
+
+def create_audit_job(chat_id: int, url: str, focus: str = "") -> dict:
+    """Фоновый аудит живой посадочной страницы через `claude -p` (landing-auditor)."""
+    out_path = AUDITS_DIR / f"{dt.date.today():%Y-%m-%d}_audit-{uuid.uuid4().hex[:8]}.md"
+    prompt = _build_audit_prompt(url, focus, out_path)
+    return _launch_job(
+        chat_id, prompt, out_path, kind="audit",
+        meta={"url": url, "focus": focus},
+    )
 
 
 def _log_tail(log_path: str, limit: int = 1200) -> str:

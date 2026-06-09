@@ -41,9 +41,10 @@ BTN_RESET = "🔄 Сброс"
 BTN_HELP = "❓ Помощь"
 BTN_MONTAGE = "🎬 ТЗ на монтаж"
 BTN_COMPETE = "📊 Сравнить конкурентов"
+BTN_AUDIT = "🔍 Аудит посадки"
 
 MENU = ReplyKeyboardMarkup(
-    [[BTN_MONTAGE], [BTN_COMPETE], [BTN_STATUS], [BTN_RESET, BTN_HELP]],
+    [[BTN_MONTAGE], [BTN_COMPETE, BTN_AUDIT], [BTN_STATUS], [BTN_RESET, BTN_HELP]],
     resize_keyboard=True,
     is_persistent=True,
 )
@@ -52,6 +53,8 @@ MENU = ReplyKeyboardMarkup(
 M_SOURCE, M_WINDOWS, M_NOTES = range(3)
 # Шаги диалога сравнения конкурентов
 C_TARGETS, C_FOCUS = range(10, 12)
+# Шаги диалога аудита посадки
+A_URL, A_FOCUS = range(20, 22)
 # Что пользователь печатает, чтобы пропустить необязательный шаг
 SKIP_WORDS = {"нет", "-", "—", "skip", "пропустить", "пропуск", "no"}
 # Интервал опроса фоновых задач (сек) — общий для монтажа и анализа
@@ -365,9 +368,99 @@ async def compete_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+# ── Диалог аудита посадки ────────────────────────────────────────────────────
+# Кнопка «🔍 Аудит посадки» → ссылка на страницу → фокус → фоновая задача:
+# claude -p запускает landing-auditor, тот проверяет живую страницу и пишет файл
+# с ранжированными правками. Та же async-механика, что у сравнения конкурентов.
+
+
+@restricted
+async def audit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if analysis_jobs.running_jobs():
+        await update.message.reply_text(
+            "Уже считаю одну задачу анализа 🔍 Дождись результата — запущу следующую.",
+            reply_markup=MENU,
+        )
+        return ConversationHandler.END
+    context.user_data["audit"] = {}
+    await update.message.reply_text(
+        "🔍 Аудит посадочной страницы.\n\n"
+        "Шаг 1/2. Кинь ссылку на страницу (наш лендинг, страница курса/акции).\n"
+        "В любой момент: /cancel — отмена."
+    )
+    return A_URL
+
+
+@restricted
+async def audit_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["audit"]["url"] = update.message.text.strip()
+    await update.message.reply_text(
+        "Шаг 2/2. На что смотреть в первую очередь? Можно через запятую.\n"
+        "Например: оффер на первом экране, структура, конверсия, правдивость, битые ссылки.\n"
+        "Если не уверена — напиши «нет», проверю по стандартной рубрике.",
+    )
+    return A_FOCUS
+
+
+@restricted
+async def audit_focus(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    data = context.user_data.get("audit", {})
+    focus = "" if text.lower() in SKIP_WORDS else text
+    try:
+        job = analysis_jobs.create_audit_job(
+            chat_id=update.effective_chat.id,
+            url=data.get("url", ""),
+            focus=focus,
+        )
+    except Exception as e:  # noqa: BLE001
+        await update.message.reply_text(f"⚠️ Не запустил: {e}", reply_markup=MENU)
+        return ConversationHandler.END
+
+    await update.message.reply_text(
+        "Принял, проверяю страницу в фоне ⏳\n\n"
+        f"• Страница: {data.get('url')}\n"
+        f"• Фокус: {focus or 'стандартная рубрика (оффер/структура/конверсия/правдивость/ссылки)'}\n\n"
+        "Оркестр открывает страницу и собирает ранжированные правки — это пара минут. "
+        "Пришлю файлом. Бот не висит.",
+        reply_markup=MENU,
+    )
+    context.user_data.pop("audit", None)
+    return ConversationHandler.END
+
+
+@restricted
+async def audit_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("audit", None)
+    await update.message.reply_text("Отменил аудит.", reply_markup=MENU)
+    return ConversationHandler.END
+
+
+# Тексты под тип задачи анализа — наблюдатель один на оба вида.
+_ANALYSIS_CAPTIONS = {
+    "competitors": (
+        "✅ Разбор конкурентов готов.\n"
+        "Сравнение + вывод. Факты со ссылками; где пробел — помечено. "
+        "Проверь перед использованием."
+    ),
+    "audit": (
+        "✅ Аудит посадки готов.\n"
+        "Ранжированные правки + топ-3 по эффекту. Где не отсмотрено — помечено. "
+        "Проверь перед правкой страницы."
+    ),
+}
+
+
+def _analysis_fail_text(job: dict) -> str:
+    tail = job.get("error_tail", "") or "лог пуст"
+    what = job.get("targets") or job.get("url") or "—"
+    label = "Аудит" if job.get("kind") == "audit" else "Разбор"
+    return f"⚠️ {label} не собрался ({what}).\n\nХвост лога:\n{tail[-1000:]}"
+
+
 async def _analysis_watcher(app: Application) -> None:
-    """Фоновая петля: сверяет задачи анализа и досылает готовый файл сравнения
-    (или причину падения). Источник правды — jobs/analysis/<id>.json."""
+    """Фоновая петля: сверяет задачи анализа (сравнение конкурентов + аудит посадки)
+    и досылает готовый файл (или причину падения). Источник правды — jobs/analysis/."""
     while True:
         try:
             for job in analysis_jobs.poll_jobs():
@@ -378,27 +471,21 @@ async def _analysis_watcher(app: Application) -> None:
                 try:
                     if job["status"] == "done":
                         out = Path(job["out_path"])
+                        caption = _ANALYSIS_CAPTIONS.get(job.get("kind"), "✅ Готово.")
                         with out.open("rb") as fh:
                             await app.bot.send_document(
                                 chat_id=chat_id,
                                 document=fh,
                                 filename=out.name,
-                                caption=(
-                                    "✅ Разбор конкурентов готов.\n"
-                                    "Сравнение + вывод. Факты со ссылками; где пробел — помечено. "
-                                    "Проверь перед использованием."
-                                ),
+                                caption=caption,
                             )
                     else:
-                        tail = job.get("error_tail", "") or "лог пуст"
                         await app.bot.send_message(
-                            chat_id=chat_id,
-                            text=f"⚠️ Разбор не собрался (кого: {job.get('targets')}).\n\n"
-                                 f"Хвост лога:\n{tail[-1000:]}",
+                            chat_id=chat_id, text=_analysis_fail_text(job)
                         )
                     analysis_jobs.mark_notified(job["id"])
                 except Exception:  # noqa: BLE001
-                    log.exception("Не удалось отправить разбор job=%s", job.get("id"))
+                    log.exception("Не удалось отправить результат анализа job=%s", job.get("id"))
         except Exception:  # noqa: BLE001
             log.exception("Сбой в наблюдателе анализа")
         await asyncio.sleep(ANALYSIS_POLL_INTERVAL)
@@ -450,6 +537,7 @@ async def _post_init(app: Application) -> None:
         [
             BotCommand("montage", "Собрать ТЗ на монтаж записи"),
             BotCommand("compete", "Сравнить конкурентов"),
+            BotCommand("audit", "Аудит посадочной страницы"),
             BotCommand("status", "Статус всех запусков"),
             BotCommand("reset", "Забыть контекст диалога"),
             BotCommand("start", "Меню и помощь"),
@@ -502,6 +590,23 @@ def main() -> None:
         ],
     )
     app.add_handler(compete_conv)
+
+    # Диалог аудита посадки — отдельная ветка, ловится ДО общего обработчика.
+    audit_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("audit", audit_start),
+            MessageHandler(filters.Regex(f"^{re.escape(BTN_AUDIT)}$"), audit_start),
+        ],
+        states={
+            A_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, audit_url)],
+            A_FOCUS: [MessageHandler(filters.TEXT & ~filters.COMMAND, audit_focus)],
+        },
+        fallbacks=[
+            CommandHandler("cancel", audit_cancel),
+            MessageHandler(filters.Regex(f"^{re.escape(BTN_RESET)}$"), audit_cancel),
+        ],
+    )
+    app.add_handler(audit_conv)
 
     # Кнопки меню шлют свой текст-метку — ловим ДО общего обработчика вопросов.
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_STATUS)}$"), status))
