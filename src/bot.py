@@ -77,9 +77,14 @@ logging.basicConfig(
 log = logging.getLogger("pult-bot")
 
 
-def _load_env() -> tuple[str, int]:
+def _parse_ids(raw: str) -> set[int]:
+    """Разобрать список id из строки (через запятую/пробел). Нецифровое — игнор."""
+    return {int(p) for p in re.split(r"[,\s]+", raw.strip()) if p.isdigit()}
+
+
+def _load_env() -> tuple[str, int, set[int]]:
     """Подтянуть .env из корня проекта (без сторонних библиотек) и вернуть
-    токен и разрешённый user id."""
+    токен, id владельца и множество id гостей (ограниченный доступ)."""
     env_path = Path(__file__).resolve().parents[1] / ".env"
     if env_path.exists():
         for line in env_path.read_text(encoding="utf-8").splitlines():
@@ -94,11 +99,25 @@ def _load_env() -> tuple[str, int]:
     if not token:
         raise SystemExit("Нет TELEGRAM_BOT_TOKEN. Заполни .env (см. .env.example).")
     if not allowed.isdigit():
-        raise SystemExit("Нет числового ALLOWED_USER_ID. Заполни .env.")
-    return token, int(allowed)
+        raise SystemExit("Нет числового ALLOWED_USER_ID (владелец). Заполни .env.")
+    owner = int(allowed)
+    # Гости — необязательный список (ограниченный доступ: статус/анализ, без записи в проект).
+    guests = _parse_ids(os.environ.get("GUEST_USER_IDS", ""))
+    guests.discard(owner)
+    return token, owner, guests
 
 
-ALLOWED_USER_ID = 0  # перезапишется в main()
+# Роли. Перезапишутся в main(). Владелец — полный доступ; гости — только чтение/анализ.
+OWNER_ID = 0
+GUEST_IDS: set[int] = set()
+
+
+def _is_owner(uid: int | None) -> bool:
+    return uid is not None and uid == OWNER_ID
+
+
+def _is_allowed(uid: int | None) -> bool:
+    return uid is not None and (uid == OWNER_ID or uid in GUEST_IDS)
 
 
 def md_to_plain(text: str) -> str:
@@ -111,23 +130,31 @@ def md_to_plain(text: str) -> str:
     return text
 
 
-def restricted(func):
-    """Пускать только владельца. Остальным — короткий отказ в лог и в чат."""
+def _guard(check, deny_msg: str):
+    """Фабрика декораторов доступа: пускает, если check(uid) истинно, иначе отказ."""
 
-    @wraps(func)
-    async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        uid = update.effective_user.id if update.effective_user else None
-        if uid != ALLOWED_USER_ID:
-            log.warning("Отказано в доступе: user_id=%s", uid)
-            if update.effective_chat:
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text="Этот бот приватный.",
-                )
-            return
-        return await func(update, context)
+    def deco(func):
+        @wraps(func)
+        async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            uid = update.effective_user.id if update.effective_user else None
+            if not check(uid):
+                log.warning("Отказано (%s): user_id=%s", func.__name__, uid)
+                if update.effective_chat:
+                    await context.bot.send_message(
+                        chat_id=update.effective_chat.id, text=deny_msg
+                    )
+                return
+            return await func(update, context)
 
-    return wrapped
+        return wrapped
+
+    return deco
+
+
+# Любой разрешённый (владелец или гость) — статус/анализ.
+restricted = _guard(_is_allowed, "Этот бот приватный.")
+# Только владелец — запись в проект, монтаж, свободный вопрос оркестру.
+owner_only = _guard(_is_owner, "Эта команда доступна только владельцу бота.")
 
 
 # Память диалога: на каждый чат — своя сессия claude. uuid детерминирован из
@@ -181,7 +208,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(board, parse_mode="Markdown")
 
 
-@restricted
+@owner_only
 async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     question = update.message.text.strip()
     chat_id = update.effective_chat.id
@@ -217,7 +244,7 @@ async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # пайплайн досчитает (его ловит наблюдатель _montage_watcher).
 
 
-@restricted
+@owner_only
 async def montage_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if montage_jobs.running_jobs():
         await update.message.reply_text(
@@ -234,7 +261,7 @@ async def montage_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return M_SOURCE
 
 
-@restricted
+@owner_only
 async def montage_source(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["montage"]["source"] = update.message.text.strip()
     await update.message.reply_text(
@@ -246,7 +273,7 @@ async def montage_source(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return M_WINDOWS
 
 
-@restricted
+@owner_only
 async def montage_windows(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     context.user_data["montage"]["windows"] = "" if text.lower() in SKIP_WORDS else text
@@ -260,7 +287,7 @@ async def montage_windows(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return M_NOTES
 
 
-@restricted
+@owner_only
 async def montage_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     data = context.user_data.get("montage", {})
@@ -291,7 +318,7 @@ async def montage_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-@restricted
+@owner_only
 async def montage_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("montage", None)
     await update.message.reply_text("Отменил сборку ТЗ.", reply_markup=MENU)
@@ -548,8 +575,8 @@ async def _post_init(app: Application) -> None:
 
 
 def main() -> None:
-    global ALLOWED_USER_ID
-    token, ALLOWED_USER_ID = _load_env()
+    global OWNER_ID, GUEST_IDS
+    token, OWNER_ID, GUEST_IDS = _load_env()
 
     app = ApplicationBuilder().token(token).post_init(_post_init).build()
     app.add_handler(CommandHandler("start", start))
@@ -614,7 +641,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_HELP)}$"), start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ask))
 
-    log.info("Пульт оркестра запущен. Владелец: %s", ALLOWED_USER_ID)
+    log.info("Пульт оркестра запущен. Владелец: %s, гостей: %s", OWNER_ID, len(GUEST_IDS))
     app.run_polling()
 
 

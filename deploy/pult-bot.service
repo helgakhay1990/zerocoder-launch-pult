@@ -1,0 +1,31 @@
+[Unit]
+Description=Pult orkestra — Telegram-бот к оркестру Zerocoder
+# Стартуем после поднятия сети
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Пользователь, ПОД КОТОРЫМ залогинен Claude Code (claude login) — важно: бот зовёт
+# `claude -p`, а его авторизация лежит в $HOME этого пользователя (~/.claude).
+User=pult
+Group=pult
+WorkingDirectory=/home/pult/Ai-homework/launch-pult
+
+# venv-питон бота (telegram только там). -u — небуферизованный лог.
+ExecStart=/home/pult/Ai-homework/launch-pult/.venv/bin/python -u src/bot.py
+
+# Авто-перезапуск: переживает падение и перезагрузку сервера.
+Restart=always
+RestartSec=5
+
+# claude CLI ищет авторизацию по HOME и бинарь по PATH — задаём явно для systemd.
+Environment=HOME=/home/pult
+Environment=PATH=/home/pult/.local/bin:/home/pult/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+
+# Лог — в журнал systemd (journalctl -u pult-bot) + файл.
+StandardOutput=append:/var/log/pult-bot/bot.log
+StandardError=append:/var/log/pult-bot/bot.log
+
+[Install]
+WantedBy=multi-user.target
