@@ -36,7 +36,7 @@ from telegram.ext import (
 )
 
 # ── Кнопочное меню (всегда внизу, тапаешь вместо набора команд) ──
-BTN_STATUS = "📊 Статус"
+BTN_STATUS = "📋 Статус"
 BTN_RESET = "🔄 Сброс"
 BTN_HELP = "❓ Помощь"
 BTN_MONTAGE = "🎬 ТЗ на монтаж"
