@@ -40,19 +40,23 @@ BTN_STATUS = "📊 Статус"
 BTN_RESET = "🔄 Сброс"
 BTN_HELP = "❓ Помощь"
 BTN_MONTAGE = "🎬 ТЗ на монтаж"
+BTN_COMPETE = "📊 Сравнить конкурентов"
 
 MENU = ReplyKeyboardMarkup(
-    [[BTN_MONTAGE], [BTN_STATUS], [BTN_RESET, BTN_HELP]],
+    [[BTN_MONTAGE], [BTN_COMPETE], [BTN_STATUS], [BTN_RESET, BTN_HELP]],
     resize_keyboard=True,
     is_persistent=True,
 )
 
 # Шаги диалога сборки ТЗ на монтаж
 M_SOURCE, M_WINDOWS, M_NOTES = range(3)
+# Шаги диалога сравнения конкурентов
+C_TARGETS, C_FOCUS = range(10, 12)
 # Что пользователь печатает, чтобы пропустить необязательный шаг
 SKIP_WORDS = {"нет", "-", "—", "skip", "пропустить", "пропуск", "no"}
-# Интервал опроса фоновых задач монтажа (сек)
+# Интервал опроса фоновых задач (сек) — общий для монтажа и анализа
 MONTAGE_POLL_INTERVAL = 30
+ANALYSIS_POLL_INTERVAL = 20
 
 # tracker / orchestra лежат рядом, в той же папке src.
 import sys
@@ -61,6 +65,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import tracker  # noqa: E402
 import orchestra  # noqa: E402
 import montage_jobs  # noqa: E402
+import analysis_jobs  # noqa: E402
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -290,6 +295,115 @@ async def montage_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+# ── Диалог сравнения конкурентов ─────────────────────────────────────────────
+# Кнопка «📊 Сравнить конкурентов» → спрашиваем кого сравнить → ось сравнения →
+# ставим фоновую задачу: claude -p (скилл ai-competitors) собирает таблицу + вывод
+# и пишет файл. Бот не висит; результат придёт файлом (ловит _analysis_watcher).
+
+
+@restricted
+async def compete_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if analysis_jobs.running_jobs():
+        await update.message.reply_text(
+            "Уже считаю один разбор 📊 Дождись результата — запущу следующий.",
+            reply_markup=MENU,
+        )
+        return ConversationHandler.END
+    context.user_data["compete"] = {}
+    await update.message.reply_text(
+        "📊 Сравниваю конкурентов.\n\n"
+        "Шаг 1/2. Кого сравнить? Кинь список — ссылки на школы/курсы или названия "
+        "через запятую.\n"
+        "Например: skillbox.ru/нейросети, eduson.academy, нетология ИИ.\n"
+        "В любой момент: /cancel — отмена."
+    )
+    return C_TARGETS
+
+
+@restricted
+async def compete_targets(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["compete"]["targets"] = update.message.text.strip()
+    await update.message.reply_text(
+        "Шаг 2/2. По какой оси сравнивать? Можно через запятую.\n"
+        "Например: цены тарифов, формат, длительность, оффер, гарантии возврата.\n"
+        "Если не уверена — напиши «нет», возьму стандартную ось.",
+    )
+    return C_FOCUS
+
+
+@restricted
+async def compete_focus(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    data = context.user_data.get("compete", {})
+    focus = "" if text.lower() in SKIP_WORDS else text
+    try:
+        job = analysis_jobs.create_competitor_job(
+            chat_id=update.effective_chat.id,
+            targets=data.get("targets", ""),
+            focus=focus,
+        )
+    except Exception as e:  # noqa: BLE001
+        await update.message.reply_text(f"⚠️ Не запустил: {e}", reply_markup=MENU)
+        return ConversationHandler.END
+
+    await update.message.reply_text(
+        "Принял, собираю разбор в фоне ⏳\n\n"
+        f"• Кого: {data.get('targets')}\n"
+        f"• Ось: {focus or 'стандартная (цены/формат/длительность/оффер/гарантии)'}\n\n"
+        "Оркестр заходит на страницы конкурентов — это пара минут. Пришлю файлом со "
+        "сравнением и выводом. Можно продолжать переписку — бот не висит.",
+        reply_markup=MENU,
+    )
+    context.user_data.pop("compete", None)
+    return ConversationHandler.END
+
+
+@restricted
+async def compete_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("compete", None)
+    await update.message.reply_text("Отменил разбор конкурентов.", reply_markup=MENU)
+    return ConversationHandler.END
+
+
+async def _analysis_watcher(app: Application) -> None:
+    """Фоновая петля: сверяет задачи анализа и досылает готовый файл сравнения
+    (или причину падения). Источник правды — jobs/analysis/<id>.json."""
+    while True:
+        try:
+            for job in analysis_jobs.poll_jobs():
+                chat_id = job.get("chat_id")
+                if not chat_id:
+                    analysis_jobs.mark_notified(job["id"])
+                    continue
+                try:
+                    if job["status"] == "done":
+                        out = Path(job["out_path"])
+                        with out.open("rb") as fh:
+                            await app.bot.send_document(
+                                chat_id=chat_id,
+                                document=fh,
+                                filename=out.name,
+                                caption=(
+                                    "✅ Разбор конкурентов готов.\n"
+                                    "Сравнение + вывод. Факты со ссылками; где пробел — помечено. "
+                                    "Проверь перед использованием."
+                                ),
+                            )
+                    else:
+                        tail = job.get("error_tail", "") or "лог пуст"
+                        await app.bot.send_message(
+                            chat_id=chat_id,
+                            text=f"⚠️ Разбор не собрался (кого: {job.get('targets')}).\n\n"
+                                 f"Хвост лога:\n{tail[-1000:]}",
+                        )
+                    analysis_jobs.mark_notified(job["id"])
+                except Exception:  # noqa: BLE001
+                    log.exception("Не удалось отправить разбор job=%s", job.get("id"))
+        except Exception:  # noqa: BLE001
+            log.exception("Сбой в наблюдателе анализа")
+        await asyncio.sleep(ANALYSIS_POLL_INTERVAL)
+
+
 async def _montage_watcher(app: Application) -> None:
     """Фоновая петля: раз в MONTAGE_POLL_INTERVAL сверяет фоновые задачи монтажа и
     досылает владельцу готовый черновик (или причину падения). Переживает рестарт —
@@ -335,12 +449,14 @@ async def _post_init(app: Application) -> None:
     await app.bot.set_my_commands(
         [
             BotCommand("montage", "Собрать ТЗ на монтаж записи"),
+            BotCommand("compete", "Сравнить конкурентов"),
             BotCommand("status", "Статус всех запусков"),
             BotCommand("reset", "Забыть контекст диалога"),
             BotCommand("start", "Меню и помощь"),
         ]
     )
     app.create_task(_montage_watcher(app))
+    app.create_task(_analysis_watcher(app))
 
 
 def main() -> None:
@@ -369,6 +485,23 @@ def main() -> None:
         ],
     )
     app.add_handler(montage_conv)
+
+    # Диалог сравнения конкурентов — тоже отдельная ветка, ловится ДО общего обработчика.
+    compete_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("compete", compete_start),
+            MessageHandler(filters.Regex(f"^{re.escape(BTN_COMPETE)}$"), compete_start),
+        ],
+        states={
+            C_TARGETS: [MessageHandler(filters.TEXT & ~filters.COMMAND, compete_targets)],
+            C_FOCUS: [MessageHandler(filters.TEXT & ~filters.COMMAND, compete_focus)],
+        },
+        fallbacks=[
+            CommandHandler("cancel", compete_cancel),
+            MessageHandler(filters.Regex(f"^{re.escape(BTN_RESET)}$"), compete_cancel),
+        ],
+    )
+    app.add_handler(compete_conv)
 
     # Кнопки меню шлют свой текст-метку — ловим ДО общего обработчика вопросов.
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_STATUS)}$"), status))
