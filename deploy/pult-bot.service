@@ -6,8 +6,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# Пользователь, ПОД КОТОРЫМ залогинен Claude Code (claude login) — важно: бот зовёт
-# `claude -p`, а его авторизация лежит в $HOME этого пользователя (~/.claude).
+# Пользователь, под которым работает бот. Авторизация Claude — через
+# ANTHROPIC_API_KEY в .env бота (его читает loader и наследует `claude -p`),
+# интерактивный `claude login` не нужен. HOME ниже — для конфига/кэша claude.
 User=pult
 Group=pult
 WorkingDirectory=/home/pult/Ai-homework/launch-pult
@@ -19,7 +20,8 @@ ExecStart=/home/pult/Ai-homework/launch-pult/.venv/bin/python -u src/bot.py
 Restart=always
 RestartSec=5
 
-# claude CLI ищет авторизацию по HOME и бинарь по PATH — задаём явно для systemd.
+# claude CLI ищет конфиг по HOME и бинарь по PATH — задаём явно для systemd.
+# Ключ ANTHROPIC_API_KEY бот берёт из своего .env, отдельно тут прописывать не нужно.
 Environment=HOME=/home/pult
 Environment=PATH=/home/pult/.local/bin:/home/pult/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
 
