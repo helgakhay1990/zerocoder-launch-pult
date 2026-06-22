@@ -266,8 +266,9 @@ async def montage_source(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["montage"]["source"] = update.message.text.strip()
     await update.message.reply_text(
         "Шаг 2/3. Окна показа экрана — где демонстрировали экран (для OCR).\n"
-        "Формат: `20m-50m,1h15m-1h40m`.\n"
-        "Если не знаешь или показа не было — напиши «нет» (отсканирую без экранного слоя).",
+        "• `авто` — сам найду окна по плотности текста на экране (рекомендую, если не помнишь тайминги).\n"
+        "• Вручную: `20m-50m,1h15m-1h40m`.\n"
+        "• `нет` — без экранного слоя (только речь).",
         parse_mode="Markdown",
     )
     return M_WINDOWS
@@ -276,7 +277,13 @@ async def montage_source(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @owner_only
 async def montage_windows(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
-    context.user_data["montage"]["windows"] = "" if text.lower() in SKIP_WORDS else text
+    if text.lower() in SKIP_WORDS:
+        windows = ""
+    elif text.lower() in ("авто", "auto"):
+        windows = "auto"
+    else:
+        windows = text
+    context.user_data["montage"]["windows"] = windows
     await update.message.reply_text(
         "Шаг 3/3. Что знаешь точно? Известные моменты пойдут в черновик как высокоуверенная "
         "затравка.\n"
@@ -303,7 +310,9 @@ async def montage_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ Не запустил: {e}", reply_markup=MENU)
         return ConversationHandler.END
 
-    win_txt = data.get("windows") or "без окон экрана (скан всей записи)"
+    win_raw = data.get("windows", "")
+    win_txt = {"": "без окон экрана (только речь)",
+               "auto": "🔍 авто-детект окон экрана"}.get(win_raw, win_raw)
     notes_txt = notes or "—"
     await update.message.reply_text(
         "Принял, считаю в фоне ⏳\n\n"

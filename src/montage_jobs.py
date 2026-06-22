@@ -84,7 +84,7 @@ def create_job(chat_id: int, source: str, windows: str, notes: str, theme: str |
     """Запустить montage_tz.py в фоне (отвязанным процессом) и записать job json.
 
     source  — Kinescope video_id / ссылка / локальный путь (montage_tz сам разберёт).
-    windows — '20m-50m,1h15m-1h40m' или пусто (тогда экранный слой не сканится).
+    windows — '20m-50m,1h15m-1h40m' / 'auto' (авто-детект окон) / пусто (экранный слой не сканится).
     notes   — известные автором моменты (высокая уверенность), через ';'.
     """
     if len(running_jobs()) >= MAX_CONCURRENT:
