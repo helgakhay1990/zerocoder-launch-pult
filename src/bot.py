@@ -36,15 +36,21 @@ from telegram.ext import (
 )
 
 # ── Кнопочное меню (всегда внизу, тапаешь вместо набора команд) ──
-BTN_STATUS = "📋 Статус"
-BTN_RESET = "🔄 Сброс"
+BTN_RESET = "🔄 Сброс диалога"
 BTN_HELP = "❓ Помощь"
-BTN_MONTAGE = "🎬 ТЗ на монтаж"
-BTN_COMPETE = "📊 Сравнить конкурентов"
-BTN_AUDIT = "🔍 Аудит посадки"
+BTN_MONTAGE = "🎬 Монтаж вебинара"
+BTN_COMPETE = "📊 Анализ конкурентов"
+BTN_AUDIT = "🔍 Аудит лендинга"
 
 MENU = ReplyKeyboardMarkup(
-    [[BTN_MONTAGE], [BTN_COMPETE, BTN_AUDIT], [BTN_STATUS], [BTN_RESET, BTN_HELP]],
+    # Каждая кнопка — отдельным рядом → во всю ширину, одна под другой.
+    [
+        [BTN_MONTAGE],
+        [BTN_COMPETE],
+        [BTN_AUDIT],
+        [BTN_RESET],
+        [BTN_HELP],
+    ],
     resize_keyboard=True,
     is_persistent=True,
 )
@@ -107,9 +113,12 @@ def _load_env() -> tuple[str, int, set[int]]:
     return token, owner, guests
 
 
-# Роли. Перезапишутся в main(). Владелец — полный доступ; гости — только чтение/анализ.
+# Роли. Перезапишутся в main(). Владелец — полный доступ.
 OWNER_ID = 0
 GUEST_IDS: set[int] = set()
+# Открытый доступ: бот доступен всем по ссылке (без списков ID и кодов).
+# Поставь OPEN_ACCESS=0 в .env, чтобы запереть на владельца + GUEST_USER_IDS.
+OPEN_ACCESS = True
 
 
 def _is_owner(uid: int | None) -> bool:
@@ -117,6 +126,8 @@ def _is_owner(uid: int | None) -> bool:
 
 
 def _is_allowed(uid: int | None) -> bool:
+    if OPEN_ACCESS:
+        return uid is not None
     return uid is not None and (uid == OWNER_ID or uid in GUEST_IDS)
 
 
@@ -151,7 +162,7 @@ def _guard(check, deny_msg: str):
     return deco
 
 
-# Любой разрешённый (владелец или гость) — статус/анализ.
+# Доступ к функциям. При OPEN_ACCESS=True пускает всех; иначе — владелец + гости.
 restricted = _guard(_is_allowed, "Этот бот приватный.")
 # Только владелец — запись в проект, монтаж, свободный вопрос оркестру.
 owner_only = _guard(_is_owner, "Эта команда доступна только владельцу бота.")
@@ -187,8 +198,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Пульт оркестра на связи.\n\n"
         "Меню снизу — тапай кнопку, команды набирать не нужно:\n"
-        f"• {BTN_STATUS} — статус всех запусков\n"
-        f"• {BTN_RESET} — забыть контекст и начать заново\n"
+        f"• {BTN_MONTAGE} — собрать ТЗ на монтаж записи\n"
+        f"• {BTN_COMPETE} — сравнить школы/курсы конкурентов\n"
+        f"• {BTN_AUDIT} — разбор посадочной страницы\n"
+        f"• {BTN_RESET} — забыть контекст и начать диалог заново\n"
         f"• {BTN_HELP} — это сообщение\n\n"
         "Или просто напиши вопрос — отвечу через оркестр (помню контекст диалога).",
         reply_markup=MENU,
@@ -203,12 +216,6 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @restricted
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    board = tracker.render_board_md(tracker.find_states())
-    await update.message.reply_text(board, parse_mode="Markdown")
-
-
-@owner_only
 async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     question = update.message.text.strip()
     chat_id = update.effective_chat.id
@@ -244,7 +251,7 @@ async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # пайплайн досчитает (его ловит наблюдатель _montage_watcher).
 
 
-@owner_only
+@restricted
 async def montage_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if montage_jobs.running_jobs():
         await update.message.reply_text(
@@ -261,7 +268,7 @@ async def montage_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return M_SOURCE
 
 
-@owner_only
+@restricted
 async def montage_source(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["montage"]["source"] = update.message.text.strip()
     await update.message.reply_text(
@@ -274,7 +281,7 @@ async def montage_source(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return M_WINDOWS
 
 
-@owner_only
+@restricted
 async def montage_windows(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if text.lower() in SKIP_WORDS:
@@ -294,7 +301,7 @@ async def montage_windows(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return M_NOTES
 
 
-@owner_only
+@restricted
 async def montage_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     data = context.user_data.get("montage", {})
@@ -327,7 +334,7 @@ async def montage_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-@owner_only
+@restricted
 async def montage_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("montage", None)
     await update.message.reply_text("Отменил сборку ТЗ.", reply_markup=MENU)
@@ -574,7 +581,6 @@ async def _post_init(app: Application) -> None:
             BotCommand("montage", "Собрать ТЗ на монтаж записи"),
             BotCommand("compete", "Сравнить конкурентов"),
             BotCommand("audit", "Аудит посадочной страницы"),
-            BotCommand("status", "Статус всех запусков"),
             BotCommand("reset", "Забыть контекст диалога"),
             BotCommand("start", "Меню и помощь"),
         ]
@@ -584,12 +590,13 @@ async def _post_init(app: Application) -> None:
 
 
 def main() -> None:
-    global OWNER_ID, GUEST_IDS
+    global OWNER_ID, GUEST_IDS, OPEN_ACCESS
     token, OWNER_ID, GUEST_IDS = _load_env()
+    OPEN_ACCESS = os.environ.get("OPEN_ACCESS", "1").strip().lower() not in ("0", "false", "no", "off", "")
+    log.info("Доступ: %s", "ОТКРЫТЫЙ (все по ссылке)" if OPEN_ACCESS else f"закрытый (владелец+{len(GUEST_IDS)} гостей)")
 
     app = ApplicationBuilder().token(token).post_init(_post_init).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("reset", reset))
 
     # Диалог ТЗ на монтаж — отдельная ветка, ловится ДО общего обработчика вопросов.
@@ -645,7 +652,6 @@ def main() -> None:
     app.add_handler(audit_conv)
 
     # Кнопки меню шлют свой текст-метку — ловим ДО общего обработчика вопросов.
-    app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_STATUS)}$"), status))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_RESET)}$"), reset))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_HELP)}$"), start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ask))
