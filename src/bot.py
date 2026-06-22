@@ -19,6 +19,8 @@ import asyncio
 import logging
 import os
 import re
+import subprocess
+import sys
 import uuid
 from functools import wraps
 from pathlib import Path
@@ -501,6 +503,32 @@ def _analysis_fail_text(job: dict) -> str:
     return f"⚠️ {label} не собрался ({what}).\n\nХвост лога:\n{tail[-1000:]}"
 
 
+# Конвертация черновика .md → .docx перед отправкой (в чате читать удобнее Markdown).
+# Общий конвертер проекта (тот же, что для отчётов): ../../.md_to_docx.py.
+_CONVERTER = Path(__file__).resolve().parents[2] / ".md_to_docx.py"
+
+
+def _to_docx(md_path: Path) -> Path:
+    """Сконвертировать .md → .docx тем же python, что крутит бота. При любой
+    проблеме вернуть исходный .md — чтобы пользователь хоть что-то получил."""
+    if md_path.suffix.lower() != ".md" or not _CONVERTER.exists():
+        return md_path
+    docx_path = md_path.with_suffix(".docx")
+    try:
+        subprocess.run([sys.executable, str(_CONVERTER), str(md_path)],
+                       capture_output=True, text=True, timeout=120)
+        if docx_path.exists():
+            return docx_path
+    except Exception:  # noqa: BLE001 — не смогли сконвертить, шлём .md
+        log.exception("Конвертация в .docx не удалась: %s", md_path.name)
+    return md_path
+
+
+async def _to_docx_async(md_path: Path) -> Path:
+    """Не блокировать event-loop бота на время конвертации."""
+    return await asyncio.get_running_loop().run_in_executor(None, _to_docx, md_path)
+
+
 async def _analysis_watcher(app: Application) -> None:
     """Фоновая петля: сверяет задачи анализа (сравнение конкурентов + аудит посадки)
     и досылает готовый файл (или причину падения). Источник правды — jobs/analysis/."""
@@ -513,7 +541,7 @@ async def _analysis_watcher(app: Application) -> None:
                     continue
                 try:
                     if job["status"] == "done":
-                        out = Path(job["out_path"])
+                        out = await _to_docx_async(Path(job["out_path"]))
                         caption = _ANALYSIS_CAPTIONS.get(job.get("kind"), "✅ Готово.")
                         with out.open("rb") as fh:
                             await app.bot.send_document(
@@ -547,7 +575,7 @@ async def _montage_watcher(app: Application) -> None:
                     continue
                 try:
                     if job["status"] == "done":
-                        out = Path(job["out_path"])
+                        out = await _to_docx_async(Path(job["out_path"]))
                         with out.open("rb") as fh:
                             await app.bot.send_document(
                                 chat_id=chat_id,
