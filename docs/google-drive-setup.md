@@ -1,87 +1,72 @@
 # Авто-выгрузка черновиков на Google Диск — настройка
 
-Бот уже присылает черновики `.docx` в Telegram. Эта настройка добавляет к ним
-**ссылку на живой Google Doc** на твоём Диске — чтобы не скачивать-заливать руками.
+Бот присылает черновики `.docx` в Telegram. Эта настройка добавляет к ним
+**ссылку на живой Google-документ** на Диске владельца — чтобы не скачивать-заливать руками.
 
-Делается один раз, ~15 минут кликов. Пока не настроено — бот работает как сейчас,
-просто без ссылки. Ничего не сломается, если пропустить.
+Делается один раз. Пока не настроено — бот работает как есть, просто без ссылки.
 
-> Зачем сервис-аккаунт, а не твой логин: боту нужен «робот-пользователь», от имени
-> которого он кладёт файлы. Ему даём доступ только к ОДНОЙ папке, что ты расшаришь.
-> К остальному Диску у него доступа нет.
+## Почему «вход как владелец», а не сервис-аккаунт
+
+Сервис-аккаунт («робот») НЕ работает на личном Gmail: у него нет своего места на
+Диске, `files.create` падает с `storageQuotaExceeded`. Проверено боем 2026-06-23.
+Рабочий способ — **пользовательский OAuth**: бот действует от имени владельца, файлы
+лежат на его Диске и считаются его квотой. Scope минимальный — `drive.file` (доступ
+только к файлам, что создал сам бот).
 
 ---
 
-## Шаг 1. Проект в Google Cloud
+## Шаг 1. Google Cloud: проект + Drive API
 
-1. Открой <https://console.cloud.google.com/>.
-2. Вверху, слева от поиска — выпадашка проектов → **New Project**.
-3. Имя, например `pult-bot-drive` → **Create**. Подожди пару секунд, выбери его в выпадашке.
+Проект с включённым **Google Drive API** (один раз). Если уже есть — пропусти.
+- <https://console.cloud.google.com/> → создать проект.
+- Включить Drive API: <https://console.cloud.google.com/apis/library/drive.googleapis.com> → **Enable**.
 
-## Шаг 2. Включить Google Drive API
+## Шаг 2. Экран согласия (OAuth consent)
 
-1. Слева меню (☰) → **APIs & Services → Library** (или в поиске «Drive API»).
-2. Найди **Google Drive API** → **Enable**.
+<https://console.cloud.google.com/apis/credentials/consent> → **Get started**:
+- Имя приложения + почта владельца в полях поддержки/контакта.
+- Audience — **External**.
+- Дойти до конца → **Publish app** (статус «In production»). Это важно: иначе
+  доступ протухает через 7 дней. Verification Google не требует — scope несенситивный.
 
-## Шаг 3. Создать сервис-аккаунт
+## Шаг 3. OAuth-клиент (Desktop app)
 
-1. ☰ → **APIs & Services → Credentials**.
-2. **Create Credentials → Service account**.
-3. Имя, например `pult-bot` → **Create and Continue**.
-4. Роль можно не выбирать (доступ дадим через расшаренную папку) → **Continue → Done**.
+<https://console.cloud.google.com/apis/credentials> → **Create Credentials → OAuth client ID**:
+- Application type — **Desktop app** → **Create**.
+- **Download JSON** → положить в `launch-pult/secrets/client_secret.json`.
 
-## Шаг 4. Скачать JSON-ключ
-
-1. На странице **Credentials** в разделе **Service Accounts** кликни по созданному аккаунту.
-2. Вкладка **Keys → Add Key → Create new key → JSON → Create**.
-3. Скачается файл `*.json`. **Это секрет — как пароль.**
-4. Положи его в проект бота, в папку `secrets/` (создай, если нет):
-   ```
-   launch-pult/secrets/gdrive-sa.json
-   ```
-   > Папка `secrets/` уже закрыта от git — ключ не попадёт в репозиторий.
-5. Заодно скопируй **e-mail сервис-аккаунта** (вид `pult-bot@pult-bot-drive.iam.gserviceaccount.com`) — он на странице аккаунта. Понадобится в шаге 5.
-
-## Шаг 5. Папка на Диске + расшарить на робота
-
-1. Открой <https://drive.google.com/> → создай папку, например **«Черновики бота»**.
-2. Зайди в папку, посмотри на адресную строку:
-   ```
-   https://drive.google.com/drive/folders/1AbCdEfGhIJKlmNOpQ...
-   ```
-   Длинный кусок после `folders/` — это **ID папки**. Скопируй.
-3. Правый клик по папке → **Share / Поделиться** → впиши e-mail сервис-аккаунта из шага 4 → роль **Editor / Редактор** → **Send**.
-
-## Шаг 6. Прописать в `.env` бота
-
-Открой `launch-pult/.env` (в Zed) и добавь две строки:
+## Шаг 4. Разовая авторизация (на машине с браузером)
 
 ```
-GOOGLE_SA_KEY_FILE=/Users/olgakhaidukova/Desktop/Ai-homework/launch-pult/secrets/gdrive-sa.json
-GOOGLE_DRIVE_FOLDER_ID=1AbCdEfGhIJKlmNOpQ...
+cd launch-pult
+.venv/bin/pip install google-auth-oauthlib        # один раз
+.venv/bin/python scripts/gdrive_authorize.py secrets/client_secret.json secrets/token.json
 ```
-(вторую — с твоим ID папки из шага 5).
+Откроется браузер → выбрать аккаунт → **Разрешить** (если «приложение не проверено» —
+«Дополнительно → перейти», это своё же приложение). На выходе — `secrets/token.json`
+с `refresh_token` (постоянный пропуск, браузер больше не нужен).
 
-## Шаг 7. Установить библиотеки и перезапустить
+## Шаг 5. Положить пропуск на сервер и включить
 
-В терминале:
 ```
-cd /Users/olgakhaidukova/Desktop/Ai-homework/launch-pult
-.venv/bin/pip install google-api-python-client google-auth
+scp secrets/token.json root@СЕРВЕР:/opt/pult-bot/launch-pult/secrets/token.json
 ```
-Потом перезапустить бота (как обычно — скажи мне «перезапусти бота», или сам по
-[reference из памяти]).
+В `.env` бота (на сервере) добавить:
+```
+GOOGLE_OAUTH_TOKEN_FILE=/opt/pult-bot/launch-pult/secrets/token.json
+GOOGLE_DRIVE_FOLDER_ID=<id папки на Диске>   # пусто = «Мой диск»
+```
+Перезапустить бота (`pm2 restart pult-bot`).
+
+> `secrets/`, `token.json`, `client_secret.json` закрыты от git — наружу не уйдут.
 
 ---
 
 ## Как проверить
 
-Запусти любую задачу бота (монтаж / анализ / аудит). Когда придёт `.docx`, в подписи
-под файлом должна появиться строка:
+Запусти любую задачу бота. Когда придёт `.docx`, в подписи под файлом появится:
 ```
 📄 Открыть в Google Docs: https://docs.google.com/document/d/...
 ```
-Ссылка ведёт в твою папку «Черновики бота» на Диске, файл — редактируемый Google Doc.
-
-Если строки нет — бот не нашёл креды (проверь пути в `.env`) или библиотеки не встали.
-В обоих случаях `.docx` всё равно приходит, выгрузка просто пропускается — данные не теряются.
+Ссылка ведёт на редактируемый Google-документ на Диске владельца.
+Нет строки — бот не нашёл `token.json` или google-библиотеки; `.docx` при этом приходит как обычно.
