@@ -78,6 +78,7 @@ import orchestra  # noqa: E402
 import montage_jobs  # noqa: E402
 import analysis_jobs  # noqa: E402
 import drive_upload  # noqa: E402
+import sheet_export  # noqa: E402
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -541,6 +542,23 @@ async def _drive_link_suffix(docx_path: Path, title: str | None = None) -> str:
     return f"\n\n📄 Открыть в Google Docs: {link}" if link else ""
 
 
+async def _sheet_link_suffix(md_path: Path, kind: str | None, title: str | None) -> str:
+    """Для анализа конкурентов: собрать матрицу сравнения отдельной Google Таблицей
+    и вернуть хвост для caption со ссылкой. Для прочих задач/без настройки — пусто."""
+    if kind != "compete" or not drive_upload.is_configured():
+        return ""
+
+    def _make() -> str | None:
+        xlsx = md_path.with_suffix(".xlsx")
+        if not sheet_export.md_to_xlsx(md_path.read_text(encoding="utf-8"), xlsx,
+                                       "Сравнение конкурентов"):
+            return None
+        return drive_upload.upload_as_gsheet(xlsx, title=(title or md_path.stem))
+
+    link = await asyncio.get_running_loop().run_in_executor(None, _make)
+    return f"\n📊 Таблица сравнения (Google Sheets): {link}" if link else ""
+
+
 async def _analysis_watcher(app: Application) -> None:
     """Фоновая петля: сверяет задачи анализа (сравнение конкурентов + аудит посадки)
     и досылает готовый файл (или причину падения). Источник правды — jobs/analysis/."""
@@ -556,6 +574,8 @@ async def _analysis_watcher(app: Application) -> None:
                         out = await _to_docx_async(Path(job["out_path"]))
                         caption = _ANALYSIS_CAPTIONS.get(job.get("kind"), "✅ Готово.")
                         caption += await _drive_link_suffix(out)
+                        caption += await _sheet_link_suffix(
+                            Path(job["out_path"]), job.get("kind"), out.stem)
                         with out.open("rb") as fh:
                             await app.bot.send_document(
                                 chat_id=chat_id,

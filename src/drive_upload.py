@@ -27,9 +27,11 @@ from pathlib import Path
 
 log = logging.getLogger("pult-bot.drive")
 
-# MIME-типы: исходник .docx → конвертация в нативный Google Doc.
+# MIME-типы: исходники → нативные форматы Google при импорте.
 _DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 _GDOC_MIME = "application/vnd.google-apps.document"
+_XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+_GSHEET_MIME = "application/vnd.google-apps.spreadsheet"
 # drive.file — минимальный scope: доступ только к файлам, что создал сам бот.
 SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 
@@ -63,11 +65,12 @@ def _load_user_creds():
     return creds
 
 
-def upload_as_gdoc(docx_path: Path, title: str | None = None) -> str | None:
-    """Залить .docx на Диск как Google Doc. Вернуть webViewLink или None.
+def _upload(src_path: Path, src_mime: str, target_mime: str,
+            title: str | None) -> str | None:
+    """Залить файл на Диск, конвертя в нативный формат Google. Вернуть webViewLink или None.
 
     None означает «не настроено / не получилось» — вызывающий просто не покажет
-    ссылку, отправка .docx в Telegram при этом не страдает.
+    ссылку, отправка файла в Telegram при этом не страдает.
     """
     if not is_configured():
         return None
@@ -84,21 +87,28 @@ def upload_as_gdoc(docx_path: Path, title: str | None = None) -> str | None:
         creds = _load_user_creds()
         service = build("drive", "v3", credentials=creds, cache_discovery=False)
 
-        meta = {
-            "name": title or docx_path.stem,
-            "mimeType": _GDOC_MIME,       # просим Drive сконвертировать в Google Doc
-        }
+        meta = {"name": title or src_path.stem, "mimeType": target_mime}
         if folder_id:
             meta["parents"] = [folder_id]
-        media = MediaFileUpload(str(docx_path), mimetype=_DOCX_MIME, resumable=False)
+        media = MediaFileUpload(str(src_path), mimetype=src_mime, resumable=False)
         created = service.files().create(
             body=meta, media_body=media,
             fields="id,webViewLink",
             supportsAllDrives=True,
         ).execute()
         link = created.get("webViewLink")
-        log.info("Черновик выгружен в Drive: %s", link)
+        log.info("Выгружено в Drive (%s): %s", target_mime, link)
         return link
     except Exception:
-        log.exception("Выгрузка в Google Drive не удалась (%s)", docx_path.name)
+        log.exception("Выгрузка в Google Drive не удалась (%s)", src_path.name)
         return None
+
+
+def upload_as_gdoc(docx_path: Path, title: str | None = None) -> str | None:
+    """Залить .docx на Диск как нативный Google Doc. Вернуть webViewLink или None."""
+    return _upload(docx_path, _DOCX_MIME, _GDOC_MIME, title)
+
+
+def upload_as_gsheet(xlsx_path: Path, title: str | None = None) -> str | None:
+    """Залить .xlsx на Диск как нативную Google Таблицу. Вернуть webViewLink или None."""
+    return _upload(xlsx_path, _XLSX_MIME, _GSHEET_MIME, title)
