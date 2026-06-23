@@ -18,6 +18,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import re
 import subprocess
 import sys
 import uuid
@@ -104,6 +105,11 @@ def create_job(chat_id: int, source: str, windows: str, notes: str, theme: str |
         cmd += ["--windows", windows]
     if notes:
         cmd += ["--notes", notes]
+    # Если автор в заметках просит вычистить годы (на экране/слайдах) — включаем
+    # поиск голых годов в OCR (--ocr-years). По умолчанию он выкл (шумит на таблицах),
+    # но раз автор прямо назвал «года» — лучше показать кандидатов, чем пропустить.
+    if notes and re.search(r"\bгод[аовуы]?\b", notes, re.IGNORECASE):
+        cmd += ["--ocr-years"]
 
     # Отвязанный процесс: переживает уход бота. Лог — в файл, чтобы видеть причину падения.
     log_f = open(log_path, "w", encoding="utf-8")  # noqa: SIM115 — держим открытым для процесса
