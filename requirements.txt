@@ -4,3 +4,7 @@
 python-telegram-bot==22.5
 # Конвертация черновиков .md → .docx перед отправкой в чат (через ../.md_to_docx.py).
 python-docx
+# Необязательно: авто-выгрузка готовых черновиков на Google Диск как Google Doc
+# (src/drive_upload.py). Нужно, только если заданы GOOGLE_SA_KEY_FILE + GOOGLE_DRIVE_FOLDER_ID.
+google-api-python-client
+google-auth

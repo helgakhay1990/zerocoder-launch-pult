@@ -1,5 +1,9 @@
 # Секреты
 .env
+# Ключ сервис-аккаунта Google Drive (JSON) — НИКОГДА не коммитить
+secrets/
+*-sa.json
+*service-account*.json
 
 # Python
 __pycache__/

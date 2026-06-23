@@ -77,6 +77,7 @@ import tracker  # noqa: E402
 import orchestra  # noqa: E402
 import montage_jobs  # noqa: E402
 import analysis_jobs  # noqa: E402
+import drive_upload  # noqa: E402
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -529,6 +530,17 @@ async def _to_docx_async(md_path: Path) -> Path:
     return await asyncio.get_running_loop().run_in_executor(None, _to_docx, md_path)
 
 
+async def _drive_link_suffix(docx_path: Path, title: str | None = None) -> str:
+    """Выгрузить .docx на Google Диск (если настроено) и вернуть хвост для caption
+    со ссылкой. Если выгрузка не настроена/не удалась — пустая строка, отправка
+    файла в Telegram при этом не страдает."""
+    if not drive_upload.is_configured():
+        return ""
+    link = await asyncio.get_running_loop().run_in_executor(
+        None, drive_upload.upload_as_gdoc, docx_path, title)
+    return f"\n\n📄 Открыть в Google Docs: {link}" if link else ""
+
+
 async def _analysis_watcher(app: Application) -> None:
     """Фоновая петля: сверяет задачи анализа (сравнение конкурентов + аудит посадки)
     и досылает готовый файл (или причину падения). Источник правды — jobs/analysis/."""
@@ -543,6 +555,7 @@ async def _analysis_watcher(app: Application) -> None:
                     if job["status"] == "done":
                         out = await _to_docx_async(Path(job["out_path"]))
                         caption = _ANALYSIS_CAPTIONS.get(job.get("kind"), "✅ Готово.")
+                        caption += await _drive_link_suffix(out)
                         with out.open("rb") as fh:
                             await app.bot.send_document(
                                 chat_id=chat_id,
@@ -576,16 +589,18 @@ async def _montage_watcher(app: Application) -> None:
                 try:
                     if job["status"] == "done":
                         out = await _to_docx_async(Path(job["out_path"]))
+                        caption = (
+                            "✅ Черновик ТЗ на монтаж готов.\n"
+                            "Это черновик на сверку — не финал монтажёру. "
+                            "Дальше: video-edit-assistant → сверка с автором."
+                        )
+                        caption += await _drive_link_suffix(out)
                         with out.open("rb") as fh:
                             await app.bot.send_document(
                                 chat_id=chat_id,
                                 document=fh,
                                 filename=out.name,
-                                caption=(
-                                    "✅ Черновик ТЗ на монтаж готов.\n"
-                                    "Это черновик на сверку — не финал монтажёру. "
-                                    "Дальше: video-edit-assistant → сверка с автором."
-                                ),
+                                caption=caption,
                             )
                     else:
                         tail = job.get("error_tail", "") or "лог пуст"
