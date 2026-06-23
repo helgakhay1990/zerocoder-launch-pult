@@ -8,9 +8,20 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
+
+# Перегрузка ИИ (временная) — повторяем, не падаем сразу.
+_OVERLOAD = re.compile(r"529|overloaded|at capacity|rate.?limit", re.IGNORECASE)
+_RETRY_MAX = 3          # всего попыток
+_RETRY_DELAY = 15       # базовая пауза, сек (растёт: 15, 30)
+
+
+def _is_overload(rc: int, out: str, err: str) -> bool:
+    return rc != 0 and bool(_OVERLOAD.search((out or "") + (err or "")))
 
 # Папка, в которой запускаем claude -p. По умолчанию — рабочая папка Ai-homework
 # (там CLAUDE.md оркестра, субагенты в .claude/agents и т.д.).
@@ -36,16 +47,21 @@ def claude_available() -> bool:
 
 def _run(cmd: list[str], cwd: Path, timeout: int):
     """Запустить claude и вернуть (код возврата, stdout, stderr).
-    На таймауте — сразу OrchestraError (повторять смысла нет)."""
-    try:
-        r = subprocess.run(
-            cmd, cwd=str(cwd), capture_output=True, text=True, timeout=timeout
-        )
-    except subprocess.TimeoutExpired:
-        raise OrchestraError(
-            f"Оркестр не ответил за {timeout} с. Сузь запрос или подними ORCHESTRA_TIMEOUT."
-        )
-    return r.returncode, r.stdout, r.stderr
+    На таймауте — сразу OrchestraError. При перегрузке ИИ (529) — авто-повтор."""
+    for attempt in range(1, _RETRY_MAX + 1):
+        try:
+            r = subprocess.run(
+                cmd, cwd=str(cwd), capture_output=True, text=True,
+                timeout=timeout, stdin=subprocess.DEVNULL,
+            )
+        except subprocess.TimeoutExpired:
+            raise OrchestraError(
+                f"Оркестр не ответил за {timeout} с. Сузь запрос или подними ORCHESTRA_TIMEOUT."
+            )
+        if attempt < _RETRY_MAX and _is_overload(r.returncode, r.stdout, r.stderr):
+            time.sleep(_RETRY_DELAY * attempt)
+            continue
+        return r.returncode, r.stdout, r.stderr
 
 
 def ask(
@@ -90,25 +106,28 @@ def ask(
 
 async def _run_async(cmd: list[str], cwd: Path, timeout: int):
     """Асинхронный аналог _run: не блокирует event-loop бота, пока крутится claude."""
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        cwd=str(cwd),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    try:
-        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
-        raise OrchestraError(
-            f"Оркестр не ответил за {timeout} с. Сузь запрос или подними ORCHESTRA_TIMEOUT."
+    for attempt in range(1, _RETRY_MAX + 1):
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=str(cwd),
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
-    return (
-        proc.returncode,
-        out.decode(errors="replace"),
-        err.decode(errors="replace"),
-    )
+        try:
+            out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            raise OrchestraError(
+                f"Оркестр не ответил за {timeout} с. Сузь запрос или подними ORCHESTRA_TIMEOUT."
+            )
+        rc = proc.returncode
+        o, e = out.decode(errors="replace"), err.decode(errors="replace")
+        if attempt < _RETRY_MAX and _is_overload(rc, o, e):
+            await asyncio.sleep(_RETRY_DELAY * attempt)
+            continue
+        return rc, o, e
 
 
 async def ask_async(

@@ -21,6 +21,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import uuid
 from functools import wraps
 from pathlib import Path
@@ -79,6 +80,7 @@ import montage_jobs  # noqa: E402
 import analysis_jobs  # noqa: E402
 import drive_upload  # noqa: E402
 import sheet_export  # noqa: E402
+import voice  # noqa: E402
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -221,7 +223,10 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @restricted
 async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    question = update.message.text.strip()
+    question = await _resolve_input(update, context)
+    if not question or not question.strip():
+        return
+    question = question.strip()
     chat_id = update.effective_chat.id
 
     # Мгновенная обратная связь + живой индикатор «печатает». Вызов оркестра —
@@ -274,7 +279,10 @@ async def montage_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @restricted
 async def montage_source(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["montage"]["source"] = update.message.text.strip()
+    ans = await _resolve_input(update, context)
+    if ans is None:
+        return M_SOURCE
+    context.user_data["montage"]["source"] = ans.strip()
     await update.message.reply_text(
         "Шаг 2/3. Окна показа экрана — где демонстрировали экран (для OCR).\n"
         "• `авто` — сам найду окна по плотности текста на экране (рекомендую, если не помнишь тайминги).\n"
@@ -287,7 +295,10 @@ async def montage_source(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @restricted
 async def montage_windows(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
+    ans = await _resolve_input(update, context)
+    if ans is None:
+        return M_WINDOWS
+    text = ans.strip()
     if text.lower() in SKIP_WORDS:
         windows = ""
     elif text.lower() in ("авто", "auto"):
@@ -307,7 +318,10 @@ async def montage_windows(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @restricted
 async def montage_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
+    ans = await _resolve_input(update, context)
+    if ans is None:
+        return M_NOTES
+    text = ans.strip()
     data = context.user_data.get("montage", {})
     notes = "" if text.lower() in SKIP_WORDS else re.sub(r"\n+", "; ", text)
     try:
@@ -372,7 +386,10 @@ async def compete_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @restricted
 async def compete_targets(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["compete"]["targets"] = update.message.text.strip()
+    ans = await _resolve_input(update, context)
+    if ans is None:
+        return C_TARGETS
+    context.user_data["compete"]["targets"] = ans.strip()
     await update.message.reply_text(
         "Шаг 2/2. По какой оси сравнивать? Можно через запятую.\n"
         "Например: цены тарифов, формат, длительность, оффер, гарантии возврата.\n"
@@ -383,7 +400,10 @@ async def compete_targets(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @restricted
 async def compete_focus(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
+    ans = await _resolve_input(update, context)
+    if ans is None:
+        return C_FOCUS
+    text = ans.strip()
     data = context.user_data.get("compete", {})
     focus = "" if text.lower() in SKIP_WORDS else text
     try:
@@ -440,7 +460,10 @@ async def audit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @restricted
 async def audit_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["audit"]["url"] = update.message.text.strip()
+    ans = await _resolve_input(update, context)
+    if ans is None:
+        return A_URL
+    context.user_data["audit"]["url"] = ans.strip()
     await update.message.reply_text(
         "Шаг 2/2. На что смотреть в первую очередь? Можно через запятую.\n"
         "Например: оффер на первом экране, структура, конверсия, правдивость, битые ссылки.\n"
@@ -451,7 +474,10 @@ async def audit_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @restricted
 async def audit_focus(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
+    ans = await _resolve_input(update, context)
+    if ans is None:
+        return A_FOCUS
+    text = ans.strip()
     data = context.user_data.get("audit", {})
     focus = "" if text.lower() in SKIP_WORDS else text
     try:
@@ -557,6 +583,36 @@ async def _sheet_link_suffix(md_path: Path, kind: str | None, title: str | None)
 
     link = await asyncio.get_running_loop().run_in_executor(None, _make)
     return f"\n📊 Таблица сравнения (Google Sheets): {link}" if link else ""
+
+
+async def _resolve_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str | None:
+    """Ответ пользователя как текст: расшифровка голосового ИЛИ набранный текст.
+
+    Голосовое → скачиваем, прогоняем через whisper, показываем расшифровку для
+    контроля и возвращаем текст. None — если голос не разобрали (бот попросит текстом).
+    """
+    msg = update.message
+    if msg is None:
+        return None
+    if msg.voice:
+        await msg.chat.send_action(ChatAction.TYPING)
+        tmp = Path(tempfile.gettempdir()) / f"voice_{update.update_id}.oga"
+        try:
+            f = await msg.voice.get_file()
+            await f.download_to_drive(str(tmp))
+            text = await asyncio.get_running_loop().run_in_executor(
+                None, voice.transcribe, tmp)
+        finally:
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:  # noqa: BLE001
+                pass
+        if text:
+            await msg.reply_text(f"🎤 Расшифровала: «{text}»")
+            return text
+        await msg.reply_text("Не разобрала голосовое 🙈 Повтори текстом, пожалуйста.")
+        return None
+    return msg.text
 
 
 async def _analysis_watcher(app: Application) -> None:
@@ -669,9 +725,9 @@ def main() -> None:
             MessageHandler(filters.Regex(f"^{re.escape(BTN_MONTAGE)}$"), montage_start),
         ],
         states={
-            M_SOURCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, montage_source)],
-            M_WINDOWS: [MessageHandler(filters.TEXT & ~filters.COMMAND, montage_windows)],
-            M_NOTES: [MessageHandler(filters.TEXT & ~filters.COMMAND, montage_notes)],
+            M_SOURCE: [MessageHandler((filters.TEXT | filters.VOICE) & ~filters.COMMAND, montage_source)],
+            M_WINDOWS: [MessageHandler((filters.TEXT | filters.VOICE) & ~filters.COMMAND, montage_windows)],
+            M_NOTES: [MessageHandler((filters.TEXT | filters.VOICE) & ~filters.COMMAND, montage_notes)],
         },
         fallbacks=[
             CommandHandler("cancel", montage_cancel),
@@ -687,8 +743,8 @@ def main() -> None:
             MessageHandler(filters.Regex(f"^{re.escape(BTN_COMPETE)}$"), compete_start),
         ],
         states={
-            C_TARGETS: [MessageHandler(filters.TEXT & ~filters.COMMAND, compete_targets)],
-            C_FOCUS: [MessageHandler(filters.TEXT & ~filters.COMMAND, compete_focus)],
+            C_TARGETS: [MessageHandler((filters.TEXT | filters.VOICE) & ~filters.COMMAND, compete_targets)],
+            C_FOCUS: [MessageHandler((filters.TEXT | filters.VOICE) & ~filters.COMMAND, compete_focus)],
         },
         fallbacks=[
             CommandHandler("cancel", compete_cancel),
@@ -704,8 +760,8 @@ def main() -> None:
             MessageHandler(filters.Regex(f"^{re.escape(BTN_AUDIT)}$"), audit_start),
         ],
         states={
-            A_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, audit_url)],
-            A_FOCUS: [MessageHandler(filters.TEXT & ~filters.COMMAND, audit_focus)],
+            A_URL: [MessageHandler((filters.TEXT | filters.VOICE) & ~filters.COMMAND, audit_url)],
+            A_FOCUS: [MessageHandler((filters.TEXT | filters.VOICE) & ~filters.COMMAND, audit_focus)],
         },
         fallbacks=[
             CommandHandler("cancel", audit_cancel),
@@ -717,7 +773,7 @@ def main() -> None:
     # Кнопки меню шлют свой текст-метку — ловим ДО общего обработчика вопросов.
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_RESET)}$"), reset))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_HELP)}$"), start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ask))
+    app.add_handler(MessageHandler((filters.TEXT | filters.VOICE) & ~filters.COMMAND, ask))
 
     log.info("Пульт оркестра запущен. Владелец: %s, гостей: %s", OWNER_ID, len(GUEST_IDS))
     app.run_polling()

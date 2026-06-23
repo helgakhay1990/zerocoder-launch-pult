@@ -39,6 +39,8 @@ ALLOWED_TOOLS = os.environ.get(
 # Свой MCP-конфиг для фоновых задач: playwright в ИЗОЛИРОВАННОМ headless-профиле,
 # чтобы не ловить lock общего профиля с основной сессией (тогда цены идут 🟢, не 🟡).
 ANALYSIS_MCP_CONFIG = LAUNCH_PULT_ROOT / "mcp-analysis.json"
+# Обёртка авто-повтора при перегрузке ИИ (529 Overloaded) — временные сбои Anthropic.
+RETRY_WRAPPER = LAUNCH_PULT_ROOT / "scripts" / "claude_retry.sh"
 MAX_CONCURRENT = 1
 
 
@@ -170,10 +172,13 @@ def _launch_job(chat_id: int, job_id: str, prompt: str, out_path: Path, kind: st
     # без коллизии с playwright основной сессии). Если конфига нет — работаем без него.
     if ANALYSIS_MCP_CONFIG.exists():
         cmd += ["--mcp-config", str(ANALYSIS_MCP_CONFIG), "--strict-mcp-config"]
+    # Обернуть в авто-повтор при 529 Overloaded (если обёртка на месте).
+    if RETRY_WRAPPER.exists():
+        cmd = ["bash", str(RETRY_WRAPPER), *cmd]
 
     log_f = open(log_path, "w", encoding="utf-8")  # noqa: SIM115
     proc = subprocess.Popen(
-        cmd, stdout=log_f, stderr=subprocess.STDOUT,
+        cmd, stdout=log_f, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
         start_new_session=True, env=os.environ.copy(), cwd=str(PROJECT_ROOT),
     )
 
