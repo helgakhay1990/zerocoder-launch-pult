@@ -126,6 +126,16 @@ GUEST_IDS: set[int] = set()
 # Поставь OPEN_ACCESS=0 в .env, чтобы запереть на владельца + GUEST_USER_IDS.
 OPEN_ACCESS = True
 
+# Пауза тяжёлых ИИ-задач (анализ конкурентов + аудит лендинга) для экономии токенов.
+# ANALYSIS_PAUSED=1 в .env — кнопки отвечают «временно на паузе», задачу не запускают.
+# Снять: ANALYSIS_PAUSED=0 (или убрать строку) + перезапуск.
+ANALYSIS_PAUSED = False
+_PAUSED_MSG = (
+    "⏸ Анализ конкурентов и аудит лендинга временно на паузе — экономим токены, "
+    "пока дорабатываем их, чтобы тратили меньше. Монтаж и чат работают как обычно. "
+    "Включим обратно, как будет готова экономичная версия."
+)
+
 
 def _is_owner(uid: int | None) -> bool:
     return uid is not None and uid == OWNER_ID
@@ -367,6 +377,9 @@ async def montage_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @restricted
 async def compete_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if ANALYSIS_PAUSED:
+        await update.message.reply_text(_PAUSED_MSG, reply_markup=MENU)
+        return ConversationHandler.END
     if analysis_jobs.running_jobs():
         await update.message.reply_text(
             "Уже считаю один разбор 📊 Дождись результата — запущу следующий.",
@@ -443,6 +456,9 @@ async def compete_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @restricted
 async def audit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if ANALYSIS_PAUSED:
+        await update.message.reply_text(_PAUSED_MSG, reply_markup=MENU)
+        return ConversationHandler.END
     if analysis_jobs.running_jobs():
         await update.message.reply_text(
             "Уже считаю одну задачу анализа 🔍 Дождись результата — запущу следующую.",
@@ -709,10 +725,11 @@ async def _post_init(app: Application) -> None:
 
 
 def main() -> None:
-    global OWNER_ID, GUEST_IDS, OPEN_ACCESS
+    global OWNER_ID, GUEST_IDS, OPEN_ACCESS, ANALYSIS_PAUSED
     token, OWNER_ID, GUEST_IDS = _load_env()
     OPEN_ACCESS = os.environ.get("OPEN_ACCESS", "1").strip().lower() not in ("0", "false", "no", "off", "")
-    log.info("Доступ: %s", "ОТКРЫТЫЙ (все по ссылке)" if OPEN_ACCESS else f"закрытый (владелец+{len(GUEST_IDS)} гостей)")
+    ANALYSIS_PAUSED = os.environ.get("ANALYSIS_PAUSED", "0").strip().lower() in ("1", "true", "yes", "on")
+    log.info("Доступ: %s | Анализ/аудит: %s", "ОТКРЫТЫЙ (все по ссылке)" if OPEN_ACCESS else f"закрытый (владелец+{len(GUEST_IDS)} гостей)", "НА ПАУЗЕ" if ANALYSIS_PAUSED else "включён")
 
     app = ApplicationBuilder().token(token).post_init(_post_init).build()
     app.add_handler(CommandHandler("start", start))
