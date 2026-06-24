@@ -66,6 +66,52 @@ C_TARGETS, C_FOCUS = range(10, 12)
 A_URL, A_FOCUS = range(20, 22)
 # Что пользователь печатает, чтобы пропустить необязательный шаг
 SKIP_WORDS = {"нет", "-", "—", "skip", "пропустить", "пропуск", "no"}
+
+# Формат таймкода окон — зеркало parse_tc() из montage_tz.py: суффиксный (20m / 1h15m30s)
+# или двоеточный (MM:SS / HH:MM:SS). Голое число (секунды) — тоже валидно.
+_TC_SUFFIX_RE = re.compile(r"^\s*(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?\s*(?:(\d+)\s*s)?\s*$", re.IGNORECASE)
+
+
+def _parse_tc(tc: str):
+    """Таймкод → секунды, или None если не разобрали (логика parse_tc из montage_tz.py)."""
+    tc = tc.strip()
+    if ":" in tc:
+        parts = tc.split(":")
+        if not all(p.isdigit() for p in parts) or not (1 <= len(parts) <= 3):
+            return None
+        nums = [int(p) for p in parts]
+        if len(parts) == 3:
+            h, m, s = nums
+        elif len(parts) == 2:
+            h, m, s = 0, nums[0], nums[1]
+        else:
+            h, m, s = 0, 0, nums[0]
+        return h * 3600 + m * 60 + s
+    sm = _TC_SUFFIX_RE.match(tc)
+    if sm and any(sm.groups()):
+        h, m, s = (int(g) if g else 0 for g in sm.groups())
+        return h * 3600 + m * 60 + s
+    if tc.isdigit():
+        return float(tc)
+    return None
+
+
+def _windows_error(spec: str):
+    """None если spec — валидный список окон 'СТАРТ-КОНЕЦ,…'; иначе строка с причиной.
+    Зеркалит parse_windows() из montage_tz.py, чтобы ловить кривой ввод до запуска задачи."""
+    chunks = [c.strip() for c in spec.split(",") if c.strip()]
+    if not chunks:
+        return "пустой список окон."
+    for chunk in chunks:
+        if "-" not in chunk:
+            return f"«{chunk}» без диапазона (нужно СТАРТ-КОНЕЦ)."
+        a, b = chunk.split("-", 1)
+        start, end = _parse_tc(a), _parse_tc(b)
+        if start is None or end is None:
+            return f"не разобрал таймкод в «{chunk}»."
+        if end <= start:
+            return f"в «{chunk}» конец не позже старта."
+    return None
 # Интервал опроса фоновых задач (сек) — общий для монтажа и анализа
 MONTAGE_POLL_INTERVAL = 30
 ANALYSIS_POLL_INTERVAL = 20
@@ -314,6 +360,19 @@ async def montage_windows(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text.lower() in ("авто", "auto"):
         windows = "auto"
     else:
+        # Свободный текст (часто голосом: «смотрим там-то…») роняет montage_tz.py
+        # уже ПОСЛЕ скачивания записи. Валидируем формат тут — до запуска задачи.
+        bad = _windows_error(text)
+        if bad:
+            await update.message.reply_text(
+                f"⚠️ Не понял окна: {bad}\n\n"
+                "Жду одно из:\n"
+                "• `авто` — найду окна показа экрана сам (рекомендую).\n"
+                "• Диапазоны: `20m-50m,1h15m-1h40m` или `0:20-0:50`.\n"
+                "• `нет` — без экранного слоя.",
+                parse_mode="Markdown",
+            )
+            return M_WINDOWS
         windows = text
     context.user_data["montage"]["windows"] = windows
     await update.message.reply_text(
