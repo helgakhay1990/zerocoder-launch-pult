@@ -112,6 +112,35 @@ def _windows_error(spec: str):
         if end <= start:
             return f"в «{chunk}» конец не позже старта."
     return None
+
+
+def _source_error(text: str):
+    """None если text — валидный источник записи (Kinescope-ссылка / video_id / путь),
+    иначе строка с причиной. Ловит свободный текст (часто голосом) до запуска задачи —
+    иначе кривой источник падает уже ПОСЛЕ «считаю в фоне»."""
+    t = text.strip()
+    if not t:
+        return "пустой источник."
+    if t.startswith(("http://", "https://")) or "kinescope.io" in t:
+        return None  # ссылка
+    if t.startswith(("/", "~", "./")):
+        return None  # локальный путь (наличие проверит пайплайн)
+    if re.fullmatch(r"[A-Za-z0-9_-]{16,}", t):
+        return None  # голый Kinescope video_id (без пробелов)
+    return ("это не похоже на источник записи. Пришли ссылку Kinescope, "
+            "video_id (одним словом, без пробелов) или путь к файлу.")
+
+
+def _url_error(text: str):
+    """None если text похож на ссылку/домен страницы, иначе строка с причиной."""
+    t = text.strip()
+    if not t:
+        return "пустая ссылка."
+    if t.startswith(("http://", "https://")):
+        return None
+    if re.fullmatch(r"[\w.-]+\.[A-Za-z]{2,}(/\S*)?", t):
+        return None  # домен вида example.com или example.com/path
+    return "это не похоже на ссылку. Пришли URL страницы (например, https://… или site.ru/page)."
 # Интервал опроса фоновых задач (сек) — общий для монтажа и анализа
 MONTAGE_POLL_INTERVAL = 30
 ANALYSIS_POLL_INTERVAL = 20
@@ -338,6 +367,15 @@ async def montage_source(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ans = await _resolve_input(update, context)
     if ans is None:
         return M_SOURCE
+    bad = _source_error(ans)
+    if bad:
+        await update.message.reply_text(
+            f"⚠️ {bad}\n\n"
+            "Примеры: `https://kinescope.io/<id>` или просто `<id>`."
+            ,
+            parse_mode="Markdown",
+        )
+        return M_SOURCE
     context.user_data["montage"]["source"] = ans.strip()
     await update.message.reply_text(
         "Шаг 2/3. Окна показа экрана — где демонстрировали экран (для OCR).\n"
@@ -537,6 +575,10 @@ async def audit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def audit_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ans = await _resolve_input(update, context)
     if ans is None:
+        return A_URL
+    bad = _url_error(ans)
+    if bad:
+        await update.message.reply_text(f"⚠️ {bad}")
         return A_URL
     context.user_data["audit"]["url"] = ans.strip()
     await update.message.reply_text(
