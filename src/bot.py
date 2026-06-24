@@ -22,6 +22,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from functools import wraps
 from pathlib import Path
@@ -212,6 +213,37 @@ _PAUSED_MSG = (
 )
 
 
+# Лимиты для открытого бота: один пользователь по ссылке не должен жечь баланс ключа.
+# Дневной лимит токен-действий (чат/конкуренты/аудит) на пользователя + кулдаун между
+# запросами. Владелец — без лимита; монтаж не считаем (токены почти не ест, уже «1 за раз»).
+# Меняется в .env: USER_DAILY_LIMIT, USER_COOLDOWN_SEC (перезаписываются в main()).
+USER_DAILY_LIMIT = 10
+USER_COOLDOWN_SEC = 15
+_throttle: dict[int, dict] = {}
+
+
+def _throttle_error(uid: int | None):
+    """None если пользователю можно (и тогда фиксируем запрос), иначе текст отказа.
+    Владелец освобождён. Дневной счётчик сбрасывается по календарному дню."""
+    if uid is None or _is_owner(uid):
+        return None
+    now = time.time()
+    today = time.strftime("%Y-%m-%d", time.localtime(now))
+    rec = _throttle.get(uid)
+    if rec is None or rec.get("day") != today:
+        rec = {"day": today, "count": 0, "last": 0.0}
+        _throttle[uid] = rec
+    wait = USER_COOLDOWN_SEC - (now - rec["last"])
+    if wait > 0:
+        return f"⏳ Помедленнее — подожди {int(wait) + 1} сек перед следующим запросом."
+    if rec["count"] >= USER_DAILY_LIMIT:
+        return (f"🚦 На сегодня лимит запросов исчерпан ({USER_DAILY_LIMIT} в сутки). "
+                "Лимит сбросится завтра.")
+    rec["count"] += 1
+    rec["last"] = now
+    return None
+
+
 def _is_owner(uid: int | None) -> bool:
     return uid is not None and uid == OWNER_ID
 
@@ -312,6 +344,10 @@ async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not question or not question.strip():
         return
     question = question.strip()
+    over = _throttle_error(update.effective_user.id if update.effective_user else None)
+    if over:
+        await update.message.reply_text(over)
+        return
     chat_id = update.effective_chat.id
 
     # Мгновенная обратная связь + живой индикатор «печатает». Вызов оркестра —
@@ -483,6 +519,10 @@ async def compete_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=MENU,
         )
         return ConversationHandler.END
+    over = _throttle_error(update.effective_user.id if update.effective_user else None)
+    if over:
+        await update.message.reply_text(over, reply_markup=MENU)
+        return ConversationHandler.END
     context.user_data["compete"] = {}
     await update.message.reply_text(
         "📊 Сравниваю конкурентов.\n\n"
@@ -561,6 +601,10 @@ async def audit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Уже считаю одну задачу анализа 🔍 Дождись результата — запущу следующую.",
             reply_markup=MENU,
         )
+        return ConversationHandler.END
+    over = _throttle_error(update.effective_user.id if update.effective_user else None)
+    if over:
+        await update.message.reply_text(over, reply_markup=MENU)
         return ConversationHandler.END
     context.user_data["audit"] = {}
     await update.message.reply_text(
@@ -826,11 +870,18 @@ async def _post_init(app: Application) -> None:
 
 
 def main() -> None:
-    global OWNER_ID, GUEST_IDS, OPEN_ACCESS, ANALYSIS_PAUSED
+    global OWNER_ID, GUEST_IDS, OPEN_ACCESS, ANALYSIS_PAUSED, USER_DAILY_LIMIT, USER_COOLDOWN_SEC
     token, OWNER_ID, GUEST_IDS = _load_env()
     OPEN_ACCESS = os.environ.get("OPEN_ACCESS", "1").strip().lower() not in ("0", "false", "no", "off", "")
     ANALYSIS_PAUSED = os.environ.get("ANALYSIS_PAUSED", "0").strip().lower() in ("1", "true", "yes", "on")
-    log.info("Доступ: %s | Анализ/аудит: %s", "ОТКРЫТЫЙ (все по ссылке)" if OPEN_ACCESS else f"закрытый (владелец+{len(GUEST_IDS)} гостей)", "НА ПАУЗЕ" if ANALYSIS_PAUSED else "включён")
+    try:
+        USER_DAILY_LIMIT = int(os.environ.get("USER_DAILY_LIMIT", USER_DAILY_LIMIT))
+        USER_COOLDOWN_SEC = int(os.environ.get("USER_COOLDOWN_SEC", USER_COOLDOWN_SEC))
+    except ValueError:
+        log.warning("USER_DAILY_LIMIT/USER_COOLDOWN_SEC не число — беру дефолты")
+    log.info("Доступ: %s | Анализ/аудит: %s | Лимит/юзера: %d/сут, кулдаун %dс",
+             "ОТКРЫТЫЙ (все по ссылке)" if OPEN_ACCESS else f"закрытый (владелец+{len(GUEST_IDS)} гостей)",
+             "НА ПАУЗЕ" if ANALYSIS_PAUSED else "включён", USER_DAILY_LIMIT, USER_COOLDOWN_SEC)
 
     app = ApplicationBuilder().token(token).post_init(_post_init).build()
     app.add_handler(CommandHandler("start", start))
