@@ -31,6 +31,11 @@ ORCHESTRA_CWD = Path(
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 ASK_TIMEOUT = int(os.environ.get("ORCHESTRA_TIMEOUT", "180"))
 
+# Модель свободного чата (самый частый канал бота). Sonnet вместо дорогого дефолта
+# CLI — заметно дешевле по токенам при том же качестве для этих задач. Пусто в
+# ORCHESTRA_MODEL — берём дефолт CLI (откат без правки кода).
+ORCHESTRA_MODEL = os.environ.get("ORCHESTRA_MODEL", "sonnet").strip()
+
 # Точечные права записи: разрешаем только Write и Edit (создать/изменить файл).
 # Bash в список НЕ входит — значит удаление (rm) и деструктивные команды закрыты.
 # Чтение и запуск субагентов и так доступны по умолчанию. Пусто — режим read-only.
@@ -88,6 +93,8 @@ def ask(
     cwd = Path(cwd) if cwd else ORCHESTRA_CWD
     timeout = timeout or ASK_TIMEOUT
     base = [CLAUDE_BIN, "-p", prompt]
+    if ORCHESTRA_MODEL:
+        base += ["--model", ORCHESTRA_MODEL]
     if ALLOWED_TOOLS:
         base += ["--allowedTools", *ALLOWED_TOOLS]
 
@@ -151,6 +158,8 @@ async def ask_async(
     cwd = Path(cwd) if cwd else ORCHESTRA_CWD
     timeout = timeout or ASK_TIMEOUT
     base = [CLAUDE_BIN, "-p", prompt]
+    if ORCHESTRA_MODEL:
+        base += ["--model", ORCHESTRA_MODEL]
     if ALLOWED_TOOLS:
         base += ["--allowedTools", *ALLOWED_TOOLS]
 
